@@ -35,7 +35,7 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
 
   if (maxStackSize) *maxStackSize = 0;
   int carveout = ncclParamL1SharedMemoryCarveout();
-  int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch);
+  int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch) + NCCL_TMA_TOTAL_SMEM_SIZE; // [jihwan] ADD TMA BUFFER
 
   int driverVersion;
   NCCLCHECK(ncclCudaDriverVersion(&driverVersion));
@@ -777,6 +777,7 @@ static ncclResult_t scheduleCollTasksToPlan(
 
     plan->channelMask |= (2ull<<devWork->channelHi) - (1ull<<devWork->channelLo);
     plan->threadPerBlock = std::max(plan->threadPerBlock, task->nWarps*WARP_SIZE);
+    plan->protocol = task->protocol; // [jihwan] Save protocol to plan
     if (!plan->kernelSpecialized) {
       plan->kernelFn = ncclDevKernelForFunc[task->devFuncId];
       plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[task->devFuncId];
@@ -1677,6 +1678,15 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   dim3 grid = {(unsigned)nChannels, 1, 1};
   dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
   int smem = ncclShmemDynamicSize(comm->cudaArch);
+
+  // [jihwan] For TMA, we need extra shared memory.
+  if (plan->protocol == NCCL_PROTO_TMA) {
+    smem += NCCL_TMA_TOTAL_SMEM_SIZE;
+
+    // [DEBUG] Print requested smem size
+    // printf("[DEBUG] Launching Kernel with smem: %d bytes (Dynamic: %d + TMA: %d)\n", smem, ncclShmemDynamicSize(comm->cudaArch), NCCL_TMA_TOTAL_SMEM_SIZE);
+  }
+
   cudaStream_t launchStream = planner->streams->stream;
 
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));

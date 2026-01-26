@@ -89,6 +89,14 @@ union ncclLLFifoLine {
 #define NCCL_MIN_NTHREADS (4*WARP_SIZE)
 #define NCCL_SIMPLE_MAX_NTHREADS 512
 #define NCCL_SIMPLE_EXTRA_GROUP_IF_NTHREADS_GE (3*WARP_SIZE)
+
+// #define NCCL_TMA_MAX_SLICE_SIZE (32 * 1024) // 32KB
+// #define NCCL_TMA_PIPE_DEPTH 2
+// #define NCCL_TMA_TOTAL_SMEM_SIZE (NCCL_TMA_MAX_SLICE_SIZE * NCCL_TMA_PIPE_DEPTH)
+// 65KB to guarantee 64KB aligned space (64KB + 1KB for safety/alignment)
+// If it is set to 96KB, performance may degrade due to a shortage of L1 cache.
+#define NCCL_TMA_TOTAL_SMEM_SIZE (65 * 1024) 
+
 #define NCCL_LL_MAX_NTHREADS 512
 #define NCCL_LL_LINES_PER_THREAD 8
 #ifdef TEST_LL_CLEANUP

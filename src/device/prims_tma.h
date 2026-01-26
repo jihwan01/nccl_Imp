@@ -582,6 +582,22 @@ private:
     tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
     stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_TMA]/NCCL_STEPS/sizeof(T) : stepSize_) {
 
+    // [jihwan] Shared memory test print  
+    // if (tid == 0 && group == 0) {
+    //   void* tmaPtr = ncclTmaShmemPtr();
+    //   void* basePtr = ncclShmemPerWarp;
+    //   long offset = (char*)tmaPtr - (char*)basePtr;
+    //   // [Simple Verification]
+    //   printf("[TMA_DEBUG] Rank %d Block %d: Allocated Dynamic SMEM Size = %d bytes\n", ncclShmem.comm.rank, blockIdx.x, ncclShmemDynamicSize());
+    //   printf("[TMA_DEBUG] Rank %d Block %d: TMA Buffer Start = %p (Offset from base = %ld bytes)\n", ncclShmem.comm.rank, blockIdx.x, tmaPtr, offset);
+    //   printf("[TMA_DEBUG] Rank %d Block %d: Targeted TMA Size = %d bytes\n", ncclShmem.comm.rank, blockIdx.x, NCCL_TMA_TOTAL_SMEM_SIZE);
+      
+    //   // Simple write check (only if enough space)
+    //   if (offset + 128 < ncclShmemDynamicSize() + NCCL_TMA_TOTAL_SMEM_SIZE) {
+    //      *(int*)tmaPtr = 0xDEADBEEF;
+    //   }
+    // }
+
     int peer = -1;
     flags = 0;
     index = -1;

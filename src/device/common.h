@@ -74,6 +74,11 @@ __device__ inline void* ncclScratchForWarp(int warp) {
   return (char*)ncclShmemPerWarp + warp*ncclShmemScratchWarpSize();
 }
 
+__device__ inline void* ncclTmaShmemPtr() {
+  uintptr_t ptr = (uintptr_t)((char*)ncclShmemPerWarp + ncclShmemDynamicSize());
+  return (void*)((ptr + 128 - 1) & ~(uintptr_t)(128 - 1)); // align up 128bit
+}
+
 __device__ inline void barrier_sync(int name) {
   #if 0
   asm volatile("barrier.sync %0;" :: "r"(name) : "memory");
