@@ -2005,7 +2005,7 @@ static ncclResult_t topoGetAlgoInfo(
       else break;
     }
   }
-  if (info->protocol == NCCL_PROTO_SIMPLE) {
+  if (info->protocol == NCCL_PROTO_SIMPLE || info->protocol == NCCL_PROTO_TMA) {
     if (info->algorithm == NCCL_ALGO_RING) nt += WARP_SIZE; // Extra warp for sync
     // More threads or sync warps needed due to split thread model
     if (info->algorithm == NCCL_ALGO_TREE) nt += 4*WARP_SIZE;
@@ -2128,8 +2128,13 @@ static ncclResult_t calcCollChunking(
   int nstepsPerLoop, nchunksPerLoop;
   size_t loopOffset = 0;
   int stepSize   = comm->buffSizes[info->protocol]/NCCL_STEPS;
-  int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
-  int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
+  // int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
+  // int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
+  
+  int chunkSteps = ((info->protocol == NCCL_PROTO_SIMPLE || info->protocol == NCCL_PROTO_TMA) && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
+  int sliceSteps = ((info->protocol == NCCL_PROTO_SIMPLE || info->protocol == NCCL_PROTO_TMA) && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
+  
+  
   int chunkSize = stepSize*chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
@@ -2140,14 +2145,14 @@ static ncclResult_t calcCollChunking(
     while (nBytes / (nChannels * comm->channels[0].collnetDirect.nHeads * chunkSize) < comm->channels[0].collnetDirect.depth * 8 && chunkSize > 65536) chunkSize /= 2;
     while (nBytes / (nChannels * comm->channels[0].collnetDirect.nHeads * chunkSize) < comm->channels[0].collnetDirect.depth * 8 && chunkSize > 32768) chunkSize /= 2;
   } else if (info->algorithm == NCCL_ALGO_COLLNET_CHAIN) {
-    stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+    stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS; // [jihwan] TODO:
     chunkSize = std::min(256 * 1024, stepSize * chunkSteps);
     while (nBytes / (nChannels * chunkSize) < comm->channels[0].collnetChain.depth * 64 && chunkSize > 131072) chunkSize /= 2;
     while (nBytes / (nChannels * chunkSize) < comm->channels[0].collnetChain.depth * 8 && chunkSize > 65536) chunkSize /= 2;
     while (nBytes / (nChannels * chunkSize) < comm->channels[0].collnetChain.depth && chunkSize > 32768) chunkSize /= 2;
   } else if (info->algorithm == NCCL_ALGO_NVLS) {
     if ((info->regBufType & NCCL_NVLS_REG_BUFFER) && (info->func == ncclFuncAllGather || info->func == ncclFuncReduceScatter)) {
-      chunkSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+      chunkSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS; // [jihwan] TODO:
     } else {
       int maxChunkSize = comm->nvlsChunkSize;
       if (comm->nNodes > 1 && comm->bandwidths[ncclFuncAllReduce][NCCL_ALGO_NVLS][NCCL_PROTO_SIMPLE] < 150) maxChunkSize = 32768;

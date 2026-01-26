@@ -42,6 +42,28 @@ struct ProtoSimple {
   static constexpr int MaxGroupWidth = 2;
 };
 
+template<int SlicePerChunk_1, int StepPerSlice_1, int Unroll_1 = COLL_UNROLL, int MultimemSrcs_1 = 0, int MultimemDsts_1 = 0>
+struct ProtoTMA {
+  static constexpr int Id = NCCL_PROTO_TMA;
+  static constexpr int SlicePerChunk = SlicePerChunk_1;
+  static constexpr int StepPerSlice = StepPerSlice_1;
+  static constexpr int Unroll = Unroll_1;
+  static constexpr int MultimemSrcs = MultimemSrcs_1;
+  static constexpr int MultimemDsts = MultimemDsts_1;
+
+  // Data bytes (no flags etc) in one step of the fifo queue.
+  __device__ static int calcBytePerStep() {
+    return ncclShmem.comm.buffSizes[NCCL_PROTO_TMA]/NCCL_STEPS;
+  }
+  // Granularity of data bytes transferred per thread.
+  __device__ static int calcBytePerGrain() {
+    return sizeof(uint64_t); // Bogus value? Nobody queries this metric for simple.
+  }
+  // Group width is how many consecutive group values a subchannel occupies.
+  static constexpr int MaxGroupWidth = 2;
+};
+
+
 struct ProtoLL {
   static constexpr int Id = NCCL_PROTO_LL;
 
@@ -154,4 +176,5 @@ __device__ inline int checkAbort(int &abortCache, const int abortValue, int &spi
 #include "prims_simple.h"
 #include "prims_ll.h"
 #include "prims_ll128.h"
+#include "prims_tma.h"
 #endif

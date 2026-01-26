@@ -42,6 +42,8 @@ struct cudaLaunchParams {
 #define NCCL_LL_THREAD_THRESHOLD 8
 #define NCCL_LL128_THREAD_THRESHOLD 8
 #define NCCL_SIMPLE_THREAD_THRESHOLD 64
+// [jihwan]
+#define NCCL_TMA_THREAD_THRESHOLD 64
 
 struct ncclSendMem {
   union {

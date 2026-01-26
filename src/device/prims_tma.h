@@ -1,22 +1,16 @@
-/*************************************************************************
- * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
- *
- * See LICENSE.txt for license information
- ************************************************************************/
-
 #include "network/unpack/unpack.h"
 #include <cassert>
 
-enum primsMode {
-  primsModeDefault = 0,
-  primsModePatRs = 1,
-  primsModePatAg = 2
-};
+// enum primsMode {
+//   primsModeDefault = 0,
+//   primsModePatRs = 1,
+//   primsModePatAg = 2
+// };
 
 template<typename T, typename RedOp, typename Fan, int Direct,
          int SlicePerChunk, int StepPerSlice, int Unroll, int P2p, int MultimemSrcs, int MultimemDsts, bool isNetOffload>
 class Primitives<
-    T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>, P2p, isNetOffload
+    T, RedOp, Fan, Direct, ProtoTMA<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>, P2p, isNetOffload
   > {
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
@@ -502,8 +496,8 @@ private:
       flags |= (conn->flags & NCCL_NVLS_MIN_POLL) ? NvlsMinPolling : 0;
       connStepPtr = conn->tail;
       connStepCache = loadStepValue(connStepPtr);
-      connStepSize = conn->stepSizes[NCCL_PROTO_SIMPLE]/sizeof(T);
-      connEltsFifo = (T*)conn->buffs[NCCL_PROTO_SIMPLE];
+      connStepSize = conn->stepSizes[NCCL_PROTO_TMA]/sizeof(T);
+      connEltsFifo = (T*)conn->buffs[NCCL_PROTO_TMA];
       if (conn->connFifo != nullptr) {
         flags |= ConnFifoEnabled;
         connFifo = conn->connFifo;
@@ -544,15 +538,15 @@ private:
 
     if (flags & RolePostSend) {
       connStepPtr = conn->tail;
-      connEltsFifo = (T*)conn->buffs[NCCL_PROTO_SIMPLE];
+      connEltsFifo = (T*)conn->buffs[NCCL_PROTO_TMA];
     }
     if (flags & RoleWaitSend) {
       if ((flags & PatMode) == 0) ncclShmem.groups[group].sendConns[index] = conn; // WaitSend role saves since that's who needs it in setDataPtrs()
       flags |= (conn->flags & NCCL_NVLS_MIN_POLL) ? NvlsMinPolling : 0;
       connStepPtr = conn->head;
       connStepCache = loadStepValue(connStepPtr);
-      connStepSize = conn->stepSizes[NCCL_PROTO_SIMPLE]/sizeof(T);
-      connEltsFifo = (T*)conn->buffs[NCCL_PROTO_SIMPLE];
+      connStepSize = conn->stepSizes[NCCL_PROTO_TMA]/sizeof(T);
+      connEltsFifo = (T*)conn->buffs[NCCL_PROTO_TMA];
       if (Direct) {
         if (ipcRegFlag) {
           // User buffers have been registered
@@ -586,7 +580,7 @@ private:
       struct ncclDevWorkP2p* p2pWork = nullptr, int stepSize_ = 0, int mode = primsModeDefault
     ):
     tid(tid), nthreads(nthreads), tidInBlock(threadIdx.x), group(group),
-    stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS/sizeof(T) : stepSize_) {
+    stepSize(stepSize_ == 0 ? ncclShmem.comm.buffSizes[NCCL_PROTO_TMA]/NCCL_STEPS/sizeof(T) : stepSize_) {
 
     int peer = -1;
     flags = 0;
@@ -674,22 +668,22 @@ private:
         struct ncclPatPeer* peer = ((struct ncclPatPeer*)recvPeers)+tid;
         struct ncclConnInfo* conn = peer->conn = ncclShmem.channel.peers[recvPeer]->recv+connIndexRecv;
         peer->step = conn->step;
-        peer->buff = conn->buffs[NCCL_PROTO_SIMPLE];
+        peer->buff = conn->buffs[NCCL_PROTO_TMA];
         peer->stepCache = loadStepValue(peer->tailPtr = conn->tail);
         peer->headPtr = conn->head;
         peer->accSize = 0;
-        peer->connStepSize = conn->stepSizes[NCCL_PROTO_SIMPLE]/sizeof(T);
+        peer->connStepSize = conn->stepSizes[NCCL_PROTO_TMA]/sizeof(T);
         // Load send peer
         int sendPeer = mode == primsModePatAg ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
         peer = ((struct ncclPatPeer*)sendPeers)+tid;
         conn = peer->conn = ncclShmem.channel.peers[sendPeer]->send+connIndexSend;
         peer->step = conn->step;
         peer->connFifo = conn->connFifo;
-        peer->buff = conn->buffs[NCCL_PROTO_SIMPLE];
+        peer->buff = conn->buffs[NCCL_PROTO_TMA];
         peer->stepCache = loadStepValue(peer->headPtr = conn->head);
         peer->tailPtr = conn->tail;
         peer->accSize = 0;
-        peer->connStepSize = conn->stepSizes[NCCL_PROTO_SIMPLE]/sizeof(T);
+        peer->connStepSize = conn->stepSizes[NCCL_PROTO_TMA]/sizeof(T);
       }
       if (tid==0) {
         ncclShmem.groups[group].userInput = (void*)inputBuf;

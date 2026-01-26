@@ -21,6 +21,12 @@ namespace {
                                                     void const* srcBuf, void* dstBuf, uint64_t redOpArg) {
     prims.setDataPtrs(srcBuf, dstBuf, redOpArg, nullptr, 0, 0);
   }
+
+  template<typename T, typename RedOp>
+  __device__ __forceinline__ void setDataPtrsHelper(Primitives<T, RedOp, FanSymmetric<1>, 0, ProtoTMA<1,1>, 0, 0>& prims,
+                                                    void const* srcBuf, void* dstBuf, uint64_t redOpArg) {
+    prims.setDataPtrs(srcBuf, dstBuf, redOpArg, nullptr, 0, 0);
+  }
 }
 
 template<typename T, typename RedOp, typename Proto>
@@ -93,6 +99,15 @@ struct RunWorkBatch<ncclFuncAllGatherV, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIM
     runAllGatherV<T, RedOp, Proto>();
   }
 };
+
+template<typename T, typename RedOp>
+struct RunWorkBatch<ncclFuncAllGatherV, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_TMA> {
+  __device__ __forceinline__ void run() {
+    using Proto = ProtoTMA<1,1>;
+    runAllGatherV<T, RedOp, Proto>();
+  }
+};
+
 template<typename T, typename RedOp>
 struct RunWorkBatch<ncclFuncAllGatherV, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL> {
   __device__ __forceinline__ void run() {

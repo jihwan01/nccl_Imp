@@ -242,6 +242,14 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL128] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_LL128] =
     getNthreads("NCCL_LL128_NTHREADS", ncclParamLl128Nthreads(), NCCL_LL128_MAX_NTHREADS/4, NCCL_LL128_MAX_NTHREADS, NCCL_LL128_MAX_NTHREADS);
 
+  // [jihwan][TMA Support] Initialize TMA threads (mirroring Simple)
+  comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_TMA] = comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
+  comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_TMA] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_SIMPLE];
+  comm->maxThreads[NCCL_ALGO_COLLNET_DIRECT][NCCL_PROTO_TMA] =
+    comm->maxThreads[NCCL_ALGO_COLLNET_CHAIN][NCCL_PROTO_TMA] =
+    comm->maxThreads[NCCL_ALGO_NVLS][NCCL_PROTO_TMA] =
+    comm->maxThreads[NCCL_ALGO_NVLS_TREE][NCCL_PROTO_TMA] = NCCL_MAX_NTHREADS;
+
   int nNodes = comm->nNodes;
   int nRanks = comm->nRanks;
   if (nRanks <= 1) return ncclSuccess;
@@ -543,6 +551,8 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
     comm->threadThresholds[a][NCCL_PROTO_LL] = NCCL_LL_THREAD_THRESHOLD;
     comm->threadThresholds[a][NCCL_PROTO_LL128] = NCCL_LL128_THREAD_THRESHOLD;
     comm->threadThresholds[a][NCCL_PROTO_SIMPLE] = NCCL_SIMPLE_THREAD_THRESHOLD;
+    // [jihwan] [TMA Support]
+    comm->threadThresholds[a][NCCL_PROTO_TMA] = NCCL_TMA_THREAD_THRESHOLD;
   }
   comm->threadThresholds[NCCL_ALGO_RING][NCCL_PROTO_LL] *= nRanks;
   comm->threadThresholds[NCCL_ALGO_COLLNET_DIRECT][NCCL_PROTO_SIMPLE] = 512;

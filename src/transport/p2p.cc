@@ -504,7 +504,11 @@ static ncclResult_t p2pSendConnect(struct ncclComm* comm, struct ncclConnect* co
       buff += comm->buffSizes[p];
     }
   }
-  send->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  // send->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  // [jihwan] Set stepsize for Simple/TMA protocol
+  for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+    send->conn.stepSizes[p] = comm->buffSizes[p]/NCCL_STEPS;
+  }
 
   if (useMemcpy) {
     send->conn.tail = &resources->proxyInfo.ceRecvMem->tail;
@@ -547,7 +551,13 @@ ncclResult_t p2pRecvConnect(struct ncclComm* comm, struct ncclConnect* connectIn
     recv->conn.ptrExchange = &remDevMem->ptrExchange;
     recv->conn.redOpArgExchange = remDevMem->redOpArgExchange;
   }
-  recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  // recv->conn.stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  // [jihwan] Set stepsize for Simple/TMA protocol
+  for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+    recv->conn.stepSizes[p] = comm->buffSizes[p]/NCCL_STEPS;
+  }
+
+
 
   char* buff = (char*)(resources->recvDevMem+1);
   for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
