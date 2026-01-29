@@ -1,5 +1,11 @@
 #include "network/unpack/unpack.h"
 #include <cassert>
+#include <cuda/barrier>
+#include <cuda/pipeline>
+#include <new>
+
+#define NCCL_TMA_PIPE_DEPTH 2
+#define NCCL_TMA_SLOT_SIZE (32 * 1024)
 
 // enum primsMode {
 //   primsModeDefault = 0,
@@ -99,6 +105,40 @@ class Primitives<
     return ld_volatile_global(ptr);
   }
 
+  // TMA Support: Wait for peer data availability for a specific slice offset without advancing the global step
+  // Renamed from waitPeerForTmaLoad to waitPeerForPreload per user request
+  template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
+  __device__ __forceinline__ void waitPeerForPreload(intptr_t srcIx, intptr_t dstIx, int offset, int nelts, int sliceOffset) {
+     if (!(flags & (Recv * RoleWaitRecv))) return;
+
+     // [Optimization] stepIncrement is always StepPerSlice due to the check above
+     uint64_t absStep = step + sliceOffset * StepPerSlice;
+     int buffSlot = absStep % NCCL_STEPS;
+     
+     // For Recv: Wait until peer has produced data for the specified slice step
+     int spins = 0;
+     while (connStepCache < absStep + StepPerSlice) { 
+       connStepCache = loadStepValue(connStepPtr); // head
+       if (checkAbort(flags, Aborted, spins)) break;
+     }
+
+     // Set up source pointers to peer's FIFO buffer at the specified step
+     void **ptrs = ncclShmem.groups[group].srcs + Src;
+     const int index = 0;
+     
+     if ((flags & ConnFifoEnabled) && connFifo[buffSlot].mode == NCCL_MODE_OFFSET) {
+       ptrs[index] = connEltsFifo + loadInt(&connFifo[buffSlot].offset)/sizeof(T);
+     } else if (DirectRecv) {
+       if (flags & DirectRead) {
+         ptrs[index] = directBuff + srcIx + offset;
+       } else {
+         ptrs[index] = connEltsFifo + buffSlot*connStepSize;
+       }
+     } else {
+       ptrs[index] = connEltsFifo + buffSlot*connStepSize;
+     }
+  }
+
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
   __device__ __forceinline__ void waitPeer(intptr_t srcIx, intptr_t dstIx, int offset, int nelts) {
     const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
@@ -189,107 +229,226 @@ class Primitives<
     int slice = 0;
     int offset = 0;
 
-    if (tid < nworkers && offset < nelem && !isNetOffload) {
-      // Worker-only loop for non-empty slices. Non-workers and empty slices are
-      // processed in the loop following this if block. The benefit of splitting
-      // the loop like this is we pull two branches out of the critical path.
-      // Using "number of branch insns (taken or not) encountered dynamically"
-      // as the performance metric, then:
-      //   perf_orig = 2*numslices
-      //   perf_new = 2+numslices
-      // So the new code and old code behave the same for numslices=2, and for
-      // numslices>2 the new code is superior. And note that in the case
-      // numslices=1, the loop is trivially unrollable (single iteration) so we
-      // don't incur that that tail branch and we still have perf_new=2.
-      //
-      // ORIGINAL CODE:
-      //   unrolled for(slices) {
-      //     if(worker) { // This branch removed
-      //       wait();
-      //       subBarrier();
-      //       if(slice not empty) // This branch removed
-      //         ReduceCopyMulti();
-      //     }
-      //     barrier();
-      //     post();
-      //   } // Since we no longer unroll, new branch added here
-      #if __CUDA_ARCH__ < 700
-        // Above doesn't matter on older hardware.
-        #pragma unroll SlicePerChunk
-      #else
-        #pragma unroll 1
-      #endif
-      do {
-        sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
-        if (tid == 0) {
-          T* userInput = (T*)ncclShmem.groups[group].userInput;
-          T* userOutput = (T*)ncclShmem.groups[group].userOutput;
-          if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
-          if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
-        }
-        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
-        subBarrier();
-        /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
-         * to 0 to avoid unnecessary workload. */
-        int workSize = ncclShmem.aborted ? 0 : sliceSize;
-        if (flags & AnyNetDeviceUnpack) {
-          ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
-          // Sync here to make sure all workers are reading from the updated srcs)
-          subBarrier();
-        }
+    // [TMA] Determine if TMA should be used (Simple Send case)
+    bool useTma = false;
+    if (Send && !Recv && Src) {
+       useTma = true;
+    }
+    
+    using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
+    __shared__ alignas(alignof(tma_barrier_t)) char barrierMem[sizeof(tma_barrier_t) * NCCL_TMA_PIPE_DEPTH];
+    tma_barrier_t* barriers = reinterpret_cast<tma_barrier_t*>(barrierMem);
+    typename tma_barrier_t::arrival_token tmaTokens[NCCL_TMA_PIPE_DEPTH];
 
-        if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
-            /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
-             * so we need to check whether MultimemSrcs and MultimemDsts are 0. */
-            && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
-          // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
-          if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
-            reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
-              (tid, nworkers, /*redArg*/0, /*postOp*/false,
-               1, ncclShmem.groups[group].srcs,
-               fan.nsend(), ncclShmem.groups[group].dsts+1,
+    if (tid < nworkers && offset < nelem && !isNetOffload) {
+      if (useTma) {
+         if (tid == 0) {
+             #pragma unroll
+             for (int i=0; i<NCCL_TMA_PIPE_DEPTH; ++i) new (&barriers[i]) tma_barrier_t(nworkers);
+         }
+         subBarrier();
+
+         // Prologue
+         int totalSlices = (nelem + sliceSize - 1) / sliceSize;
+         int preloadCount = min(NCCL_TMA_PIPE_DEPTH, totalSlices);
+         
+         for (int i=0; i<preloadCount; ++i) {
+             int currSliceSize = (sliceSize < nelem - offset) ? sliceSize : nelem - offset;
+             int tmaSlot = i % NCCL_TMA_PIPE_DEPTH;
+             
+             if (tid == 0) {
+                 T* userIn = (T*)ncclShmem.groups[group].userInput;
+                 T* userOut = (T*)ncclShmem.groups[group].userOutput;
+                 // Set Global Src for TMA
+                 ncclShmem.groups[group].srcs[0] = (SrcBuf == Input ? userIn : userOut) + srcIx + offset;
+                 
+                 void* globalSrc = ncclShmem.groups[group].srcs[0];
+                 void* shmemDst = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
+                 
+                 #if __CUDA_ARCH__ >= 900
+                 cuda::memcpy_async(
+                    shmemDst, 
+                    globalSrc, 
+                    cuda::aligned_size_t<16>(currSliceSize * sizeof(T)), 
+                    barriers[tmaSlot]
+                 );
+                 #endif
+             }
+             tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
+             offset += currSliceSize;
+         }
+         
+         offset = 0; // Reset for execution loop
+         
+         for (int s=0; s<totalSlices; ++s) {
+             int currSliceSize = (sliceSize < nelem - offset) ? sliceSize : nelem - offset;
+             int tmaSlot = s % NCCL_TMA_PIPE_DEPTH;
+             
+             // Commit Step AND Setup Ptrs (Standard waitPeer)
+             // NOTE: waitPeer sets srcs[0] to User Buffer. We will swap it after loading TMA.
+             if (tid == 0) {
+               T* userInput = (T*)ncclShmem.groups[group].userInput;
+               T* userOutput = (T*)ncclShmem.groups[group].userOutput;
+               if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
+               if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
+             }
+             waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, currSliceSize);
+             subBarrier();
+             
+             // Wait TMA
+             barriers[tmaSlot].wait(std::move(tmaTokens[tmaSlot]));
+             
+             // Pointer Swap for Consumer
+             if (tid == 0) {
+                 ncclShmem.groups[group].srcs[0] = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
+             }
+             subBarrier();
+             
+             int workSize = ncclShmem.aborted ? 0 : currSliceSize;
+             
+             // --- DUPLICATED REDUCE COPY LOGIC START ---
+             if (flags & AnyNetDeviceUnpack) {
+                ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+                subBarrier();
+             }
+
+             if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
+                 && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
+               if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
+                 reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                   (tid, nworkers, /*redArg*/0, /*postOp*/false,
+                    1, ncclShmem.groups[group].srcs,
+                    fan.nsend(), ncclShmem.groups[group].dsts+1,
+                    workSize);
+               }
+             } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
+               reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+                 (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
+                  Recv, ncclShmem.groups[group].srcs,
+                  Dst, ncclShmem.groups[group].dsts,
+                  workSize);
+             } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+               constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
+               if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
+                 reduceCopyShared<Unroll, RedOp, T,
+                   0, Recv + Src, Recv * MaxRecv + Src,
+                   0, 1, 1, PreOpSrcs>
+                   (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
+                     Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                     1, ncclShmem.groups[group].dsts,
+                     workSize);
+               } else {
+                 reduceCopyShared<Unroll, RedOp, T,
+                   MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+                   MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+                   (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
+                     Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                     Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+                     workSize);
+               }
+             } else {
+               workSize = 0;
+             }
+             // --- DUPLICATED REDUCE COPY LOGIC END ---
+
+             barrier(); 
+             postPeer<Recv, Send>(0 < workSize);
+             
+             /* [TMA] Refill after consumption to ensure slot is free */
+             int nextSliceIdx = s + NCCL_TMA_PIPE_DEPTH;
+             if (nextSliceIdx < totalSlices) {
+                 int nextOffset = offset + NCCL_TMA_PIPE_DEPTH * sliceSize; // Use original sliceSize for offset calc
+                 int nextSliceSize = (sliceSize < nelem - nextOffset) ? sliceSize : nelem - nextOffset;
+                 
+                 // Note: We're reusing the slot of the current slice (s), which we just finished consuming
+                 if (tid == 0) {
+                    T* userIn = (T*)ncclShmem.groups[group].userInput;
+                    T* userOut = (T*)ncclShmem.groups[group].userOutput;
+                    ncclShmem.groups[group].srcs[0] = (SrcBuf == Input ? userIn : userOut) + srcIx + nextOffset;
+
+                    void* globalSrc = ncclShmem.groups[group].srcs[0];
+                    void* shmemDst = (char*)ncclTmaShmemPtr() + (nextSliceIdx % NCCL_TMA_PIPE_DEPTH) * NCCL_TMA_SLOT_SIZE;
+                    #if __CUDA_ARCH__ >= 900
+                    cuda::memcpy_async(
+                        shmemDst, 
+                        globalSrc, 
+                        cuda::aligned_size_t<16>(nextSliceSize * sizeof(T)), 
+                        barriers[nextSliceIdx % NCCL_TMA_PIPE_DEPTH]
+                    );
+                    #endif
+                 }
+                 tmaTokens[nextSliceIdx % NCCL_TMA_PIPE_DEPTH] = barriers[nextSliceIdx % NCCL_TMA_PIPE_DEPTH].arrive();
+             }
+
+             offset += currSliceSize;
+         }
+      } else {
+        // [Simple] Existing Code Branch
+        #if __CUDA_ARCH__ < 700
+          #pragma unroll SlicePerChunk
+        #else
+          #pragma unroll 1
+        #endif
+        do {
+          sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
+          if (tid == 0) {
+            T* userInput = (T*)ncclShmem.groups[group].userInput;
+            T* userOutput = (T*)ncclShmem.groups[group].userOutput;
+            if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
+            if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
+          }
+          waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
+          subBarrier();
+        
+          int workSize = ncclShmem.aborted ? 0 : sliceSize;
+          if (flags & AnyNetDeviceUnpack) {
+            ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+            subBarrier();
+          }
+
+          if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
+              && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
+            if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
+              reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                (tid, nworkers, /*redArg*/0, /*postOp*/false,
+                 1, ncclShmem.groups[group].srcs,
+                 fan.nsend(), ncclShmem.groups[group].dsts+1,
+                 workSize);
+            }
+          } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
+            reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+              (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
+               Recv, ncclShmem.groups[group].srcs,
+               Dst, ncclShmem.groups[group].dsts,
                workSize);
-          }
-        } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
-          // For broadcast in CollNet to do empty send
-          reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
-            (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
-             Recv, ncclShmem.groups[group].srcs,
-             Dst, ncclShmem.groups[group].dsts,
-             workSize);
-        } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
-          constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
-          if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
-            // this case should only be directCopySend() with registered buffers and send to net peer
-            reduceCopy<Unroll, RedOp, T,
-              0, Recv + Src, Recv * MaxRecv + Src,
-              0, 1, 1, PreOpSrcs>
-              (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
-                Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                1, ncclShmem.groups[group].dsts,
-                workSize);
+          } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+            constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
+            if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
+              reduceCopy<Unroll, RedOp, T,
+                0, Recv + Src, Recv * MaxRecv + Src,
+                0, 1, 1, PreOpSrcs>
+                (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
+                  Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                  1, ncclShmem.groups[group].dsts,
+                  workSize);
+            } else {
+              reduceCopy<Unroll, RedOp, T,
+                MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+                MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+                (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
+                  Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                  Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+                  workSize);
+            }
           } else {
-            reduceCopy<Unroll, RedOp, T,
-              MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
-              MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-              (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
-                Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
-                workSize);
+            workSize = 0;
           }
-        } else {
-          // we will come here when calling prims.directSend with net peer,
-          // in this case, ncclShmem.groups[group].dsts[0] == NULL, so we
-          // skip data flush.
-          workSize = 0;
-        }
-        barrier(); // This barrier has a counterpart in following loop
-        postPeer<Recv, Send>(0 < workSize);
-        offset += sliceSize;
-        slice += 1;
-        // Yes, for some template arguments this code will be unreachable.  That's fine.
-        // coverity[dead_error_line]
-      } while (slice < SlicePerChunk && offset < nelem);
+          barrier(); 
+          postPeer<Recv, Send>(0 < workSize);
+          offset += sliceSize;
+          slice += 1;
+        } while (slice < SlicePerChunk && offset < nelem);
+      }
     }
 
     // Non-workers come straight here. Workers too but only once the remaining
