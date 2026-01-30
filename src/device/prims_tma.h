@@ -109,34 +109,35 @@ class Primitives<
   // Renamed from waitPeerForTmaLoad to waitPeerForPreload per user request
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
   __device__ __forceinline__ void waitPeerForPreload(intptr_t srcIx, intptr_t dstIx, int offset, int nelts, int sliceOffset) {
-     if (!(flags & (Recv * RoleWaitRecv))) return;
-
-     // [Optimization] stepIncrement is always StepPerSlice due to the check above
-     uint64_t absStep = step + sliceOffset * StepPerSlice;
-     int buffSlot = absStep % NCCL_STEPS;
      
-     // For Recv: Wait until peer has produced data for the specified slice step
-     int spins = 0;
-     while (connStepCache < absStep + StepPerSlice) { 
-       connStepCache = loadStepValue(connStepPtr); // head
-       if (checkAbort(flags, Aborted, spins)) break;
-     }
+    if (!(flags & (Recv * RoleWaitRecv))) return;
 
-     // Set up source pointers to peer's FIFO buffer at the specified step
-     void **ptrs = ncclShmem.groups[group].srcs + Src;
-     const int index = 0;
+    // [Optimization] stepIncrement is always StepPerSlice due to the check above
+    uint64_t absStep = step + sliceOffset * StepPerSlice;
+    int buffSlot = absStep % NCCL_STEPS;
      
-     if ((flags & ConnFifoEnabled) && connFifo[buffSlot].mode == NCCL_MODE_OFFSET) {
-       ptrs[index] = connEltsFifo + loadInt(&connFifo[buffSlot].offset)/sizeof(T);
-     } else if (DirectRecv) {
-       if (flags & DirectRead) {
-         ptrs[index] = directBuff + srcIx + offset;
-       } else {
-         ptrs[index] = connEltsFifo + buffSlot*connStepSize;
-       }
-     } else {
-       ptrs[index] = connEltsFifo + buffSlot*connStepSize;
-     }
+    // For Recv: Wait until peer has produced data for the specified slice step
+    int spins = 0;
+    while (connStepCache < absStep + StepPerSlice) { 
+      connStepCache = loadStepValue(connStepPtr); // head
+      if (checkAbort(flags, Aborted, spins)) break;
+    }
+
+    // Set up source pointers to peer's FIFO buffer at the specified step
+    void **ptrs = ncclShmem.groups[group].srcs + Src;
+    const int index = 0;
+    
+    if ((flags & ConnFifoEnabled) && connFifo[buffSlot].mode == NCCL_MODE_OFFSET) {
+      ptrs[index] = connEltsFifo + loadInt(&connFifo[buffSlot].offset)/sizeof(T);
+    } else if (DirectRecv) {
+      if (flags & DirectRead) {
+        ptrs[index] = directBuff + srcIx + offset;
+      } else {
+        ptrs[index] = connEltsFifo + buffSlot*connStepSize;
+      }
+    } else {
+      ptrs[index] = connEltsFifo + buffSlot*connStepSize;
+    }
   }
 
   template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
@@ -229,12 +230,50 @@ class Primitives<
     int slice = 0;
     int offset = 0;
 
-    // [TMA] Determine if TMA should be used (Simple Send case)
+    // [TMA] Determine if TMA should be used based on test mode
+    // 1: Send Only, 2: RecvSend Only, 3: Recv Only, 4: All, 5: Send,Recv, 6: Send,RecvSend
+    const int tmaMode = 7; 
     bool useTma = false;
-    if (Send && !Recv && Src) {
-       useTma = true;
+
+    // Check availability (Src present for Send, or Recv role)
+    // Note: Recv role implies pulling from Peer (Network) to SMEM
+    bool isTmaEligible = (Send && !Recv && Src) || (Recv);
+
+    if (sliceSize > NCCL_TMA_SLOT_SIZE) {
+        // if (tid == 0 && isTmaEligible) printf("[TMA Fallback] Slice Size (%d bytes) > Slot Size (%d bytes)\n", sliceSize * (int)sizeof(T), NCCL_TMA_SLOT_SIZE);
+        isTmaEligible = false;
     }
-    
+
+    // [TMA Safety] Check alignments. If using TMA, we must ensure 16-byte alignment
+    // for both Address and Size to avoid single-thread software copy fallback which is slow.
+    if (isTmaEligible) {
+        if (Src) {
+            T* ptr = (SrcBuf == Input ? (T*)ncclShmem.groups[group].userInput : (T*)ncclShmem.groups[group].userOutput) + srcIx;
+             // Check Base Alignment
+            if ((uintptr_t)ptr % 16 != 0) {
+                // if (tid == 0) printf("[TMA Fallback] Source Address Misaligned: %p\n", ptr);
+                isTmaEligible = false;
+            }
+        }
+        // Check Size Alignment (sliceSize is in elements, so * sizeof(T))
+        if ((sliceSize * sizeof(T)) % 16 != 0) {
+            // if (tid == 0) printf("[TMA Fallback] Copy Size Misaligned: %d bytes\n", sliceSize * (int)sizeof(T));
+            isTmaEligible = false;
+        }
+    }
+
+    if (isTmaEligible) {
+        switch(tmaMode) {
+            case 1: useTma = (Send && !Recv); break;
+            case 2: useTma = (Send && Recv); break;
+            case 3: useTma = (!Send && Recv); break;
+            case 4: useTma = true; break;
+            case 5: useTma = (Send && !Recv) || (!Send && Recv); break;
+            case 6: useTma = (Send); break;
+            case 7: useTma = false; break;
+        }
+    }
+
     using tma_barrier_t = cuda::barrier<cuda::thread_scope_block>;
     __shared__ alignas(alignof(tma_barrier_t)) char barrierMem[sizeof(tma_barrier_t) * NCCL_TMA_PIPE_DEPTH];
     tma_barrier_t* barriers = reinterpret_cast<tma_barrier_t*>(barrierMem);
@@ -256,22 +295,39 @@ class Primitives<
              int currSliceSize = (sliceSize < nelem - offset) ? sliceSize : nelem - offset;
              int tmaSlot = i % NCCL_TMA_PIPE_DEPTH;
              
-             if (tid == 0) {
+             // 1. Setup User Buffer Src (Only if using local Source)
+             if (tid == 0 && Src) {
                  T* userIn = (T*)ncclShmem.groups[group].userInput;
                  T* userOut = (T*)ncclShmem.groups[group].userOutput;
-                 // Set Global Src for TMA
                  ncclShmem.groups[group].srcs[0] = (SrcBuf == Input ? userIn : userOut) + srcIx + offset;
-                 
+             }
+
+             // 2. Request Peer Data (Sets srcs[0] to Network Buffer if Recv)
+             waitPeerForPreload<DirectRecv, DirectSend, Recv, Send, Src, Dst>(
+                srcIx, dstIx, offset, currSliceSize, /*sliceOffset=*/i);
+
+             // 3. Issue TMA Copy
+             if (tid == 0) {
                  void* globalSrc = ncclShmem.groups[group].srcs[0];
                  void* shmemDst = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
                  
+                 size_t copySize = currSliceSize * sizeof(T);
                  #if __CUDA_ARCH__ >= 900
-                 cuda::memcpy_async(
-                    shmemDst, 
-                    globalSrc, 
-                    cuda::aligned_size_t<16>(currSliceSize * sizeof(T)), 
-                    barriers[tmaSlot]
-                 );
+                 if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
+                    cuda::memcpy_async(
+                        shmemDst, 
+                        globalSrc, 
+                        cuda::aligned_size_t<16>(copySize), 
+                        barriers[tmaSlot]
+                    );
+                 } else {
+                    cuda::memcpy_async(
+                        shmemDst, 
+                        globalSrc, 
+                        copySize, 
+                        barriers[tmaSlot]
+                    );
+                 }
                  #endif
              }
              tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
@@ -357,30 +413,50 @@ class Primitives<
              /* [TMA] Refill after consumption to ensure slot is free */
              int nextSliceIdx = s + NCCL_TMA_PIPE_DEPTH;
              if (nextSliceIdx < totalSlices) {
-                 int nextOffset = offset + NCCL_TMA_PIPE_DEPTH * sliceSize; // Use original sliceSize for offset calc
+                 int nextOffset = offset + NCCL_TMA_PIPE_DEPTH * sliceSize; 
                  int nextSliceSize = (sliceSize < nelem - nextOffset) ? sliceSize : nelem - nextOffset;
+                 int nextSlot = nextSliceIdx % NCCL_TMA_PIPE_DEPTH;
                  
-                 // Note: We're reusing the slot of the current slice (s), which we just finished consuming
-                 if (tid == 0) {
+                 // 1. Setup User Buffer Src (Only if using local Source)
+                 if (tid == 0 && Src) {
                     T* userIn = (T*)ncclShmem.groups[group].userInput;
                     T* userOut = (T*)ncclShmem.groups[group].userOutput;
                     ncclShmem.groups[group].srcs[0] = (SrcBuf == Input ? userIn : userOut) + srcIx + nextOffset;
+                 }
+                 
+                 // 2. Request Peer Data (Sets srcs[0] to Network Buffer if Recv)
+                 waitPeerForPreload<DirectRecv, DirectSend, Recv, Send, Src, Dst>(
+                    srcIx, dstIx, nextOffset, nextSliceSize, NCCL_TMA_PIPE_DEPTH - 1);
 
+                 // 3. Issue TMA Copy
+                 if (tid == 0) {
                     void* globalSrc = ncclShmem.groups[group].srcs[0];
-                    void* shmemDst = (char*)ncclTmaShmemPtr() + (nextSliceIdx % NCCL_TMA_PIPE_DEPTH) * NCCL_TMA_SLOT_SIZE;
+                    void* shmemDst = (char*)ncclTmaShmemPtr() + nextSlot * NCCL_TMA_SLOT_SIZE;
+                    
+                    size_t copySize = nextSliceSize * sizeof(T);
                     #if __CUDA_ARCH__ >= 900
-                    cuda::memcpy_async(
-                        shmemDst, 
-                        globalSrc, 
-                        cuda::aligned_size_t<16>(nextSliceSize * sizeof(T)), 
-                        barriers[nextSliceIdx % NCCL_TMA_PIPE_DEPTH]
-                    );
+                    if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
+                        cuda::memcpy_async(
+                            shmemDst, 
+                            globalSrc, 
+                            cuda::aligned_size_t<16>(copySize), 
+                            barriers[nextSlot]
+                        );
+                    } else {
+                        cuda::memcpy_async(
+                            shmemDst, 
+                            globalSrc, 
+                            copySize, 
+                            barriers[nextSlot]
+                        );
+                    }
                     #endif
                  }
-                 tmaTokens[nextSliceIdx % NCCL_TMA_PIPE_DEPTH] = barriers[nextSliceIdx % NCCL_TMA_PIPE_DEPTH].arrive();
+                 tmaTokens[nextSlot] = barriers[nextSlot].arrive();
              }
 
              offset += currSliceSize;
+             slice += 1;
          }
       } else {
         // [Simple] Existing Code Branch

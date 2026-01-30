@@ -334,7 +334,7 @@ __device__ __forceinline__ void reduceCopyPacksShared(
         } else {
           // Use ld_shared for optimal shared memory loading (replacing pointer cast)
           // minSrcs[0] is uintptr_t, casting to uint32_t gives the shared memory offset
-          acc[u] = ld_shared<BytePerPack>((uint32_t)minSrcs[0]);
+          acc[u] = ld_shared<BytePerPack>(cvta_to_shared((void*)minSrcs[0]));
           if (0 < PreOpSrcs) acc[u] = applyPreOp(redFn, acc[u]);
         }
         minSrcs[0] += WARP_SIZE*BytePerPack;
@@ -349,7 +349,7 @@ __device__ __forceinline__ void reduceCopyPacksShared(
         if (s < MultimemSrcs) {
           tmp[u] = applyLoadMultimem<RedFn, BytePerPack>(redFn, minSrcs[s]);
         } else {
-          tmp[u] = ld_shared<BytePerPack>((uint32_t)minSrcs[s]);
+          tmp[u] = ld_shared<BytePerPack>(cvta_to_shared((void*)minSrcs[s]));
         }
         minSrcs[s] += WARP_SIZE*BytePerPack;
       }
@@ -364,7 +364,7 @@ __device__ __forceinline__ void reduceCopyPacksShared(
       BytePack<BytePerPack> tmp[Unroll];
       #pragma unroll Unroll
       for (int u=0; u < Unroll; u++) {
-        tmp[u] = ld_shared<BytePerPack>((uint32_t)src);
+        tmp[u] = ld_shared<BytePerPack>(cvta_to_shared((void*)src));
         src += WARP_SIZE*BytePerPack;
       }
       #pragma unroll Unroll
@@ -464,6 +464,8 @@ __device__ __forceinline__ void reduceCopyShared(
         (nThreads, /*&*/thread, redArg, postOp,
          nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
       if (nBytesAhead == 0) return;
+    } else {
+        if (thread == 0) printf("[Performance Warning] reduceCopyShared Alignment Failed! Falling back to scalar copy (BytePerPack=%d). Check Dst/Src alignment.\n", (int)sizeof(T));
     }
   }
 
