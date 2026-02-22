@@ -579,6 +579,7 @@ private:
   }
 
  public:
+  int profileChunkId = -1;
   __device__ Primitives(
       int tid, int nthreads, int const *recvPeers, int const *sendPeers,
       void const *inputBuf, void *outputBuf, uint64_t redOpArg, uint8_t group=0,

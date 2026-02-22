@@ -8,6 +8,10 @@
 #include "collectives.h"
 #include "primitives.h"
 
+#ifndef ENABLE_PROFILING
+#define ENABLE_PROFILING 1
+#endif
+
 namespace {
   template<typename T, typename RedOp, typename Proto, bool isNetOffload = false>
   __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -40,8 +44,17 @@ namespace {
       // coverity[callee_ptr_arith:FALSE]
       Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0, isNetOffload> prims
         (tid, workNthreads, &ring->prev, &ring->next, inputBuf, outputBuf, work->redOpArg, 0, 0, 0, work, NULL, isNetOffload ? NCCL_MAX_NET_SIZE : 0);
+      
+      long long t0;
+      int chunkId = 0;
+
       for (size_t elemOffset = 0; elemOffset < partCount; elemOffset += chunkCount) {
         /////////////// begin AllGather steps ///////////////
+        
+#if ENABLE_PROFILING
+        prims.profileChunkId = chunkId;
+#endif
+
         nelem = min(chunkCount, partCount - elemOffset);
         dataOffset = partOffset + elemOffset;
 
@@ -50,16 +63,37 @@ namespace {
         offset = dataOffset + rankDest * count;
 
         if ((inputBuf + dataOffset == outputBuf + offset) || isNetOffload) { // In place or onePPN
+          t0 = clock64();
           prims.directSend(dataOffset, offset, nelem);
+          long long dt = clock64() - t0;
+#if ENABLE_PROFILING
+          if (tid == 0) {
+            printf("NCCL_PROFILE_CHUNK,%d,%d,SEND,%lld\n", ncclShmem.channelId, chunkId, dt);
+          }
+#endif
         } else {
+          t0 = clock64();
           prims.directCopySend(dataOffset, offset, nelem);
+          long long dt = clock64() - t0;
+#if ENABLE_PROFILING
+          if (tid == 0) {
+            printf("NCCL_PROFILE_CHUNK,%d,%d,SEND,%lld\n", ncclShmem.channelId, chunkId, dt);
+          }
+#endif
         }
 
         // k-2 steps: copy to next GPU
         for (int j = 1; j < nranks - 1; ++j) {
           rankDest = ringRanks[nranks - j];
           offset = dataOffset + rankDest * count;
+          t0 = clock64();
           prims.directRecvCopyDirectSend(offset, offset, nelem);
+          long long dt = clock64() - t0;
+#if ENABLE_PROFILING
+          if (tid == 0) {
+            printf("NCCL_PROFILE_CHUNK,%d,%d,RECVSEND,%lld\n", ncclShmem.channelId, chunkId, dt);
+          }
+#endif
         }
 
         // Make final copy from buffer to dest.
@@ -67,7 +101,16 @@ namespace {
         offset = dataOffset + rankDest * count;
 
         // Final wait/copy.
+        t0 = clock64();
         prims.directRecv(offset, nelem);
+        long long dt = clock64() - t0;
+#if ENABLE_PROFILING
+        if (tid == 0) {
+            printf("NCCL_PROFILE_CHUNK,%d,%d,RECV,%lld\n", ncclShmem.channelId, chunkId, dt);
+        }
+#endif
+
+        chunkId++;
       }
     } else if (inputBuf != outputBuf + ringRanks[0] * count) {
       inputBuf = inputBuf + partOffset;

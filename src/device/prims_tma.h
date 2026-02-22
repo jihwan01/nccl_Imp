@@ -10,6 +10,10 @@
 // TMA debugging - set to 1 to enable detailed logging, 0 to disable
 #define NCCL_TMA_DEBUG 0
 
+#ifndef ENABLE_PROFILING
+#define ENABLE_PROFILING 1
+#endif
+
 #if NCCL_TMA_DEBUG
   #define TMA_DEBUG_PRINT(...) printf(__VA_ARGS__)
 #else
@@ -27,6 +31,11 @@ template<typename T, typename RedOp, typename Fan, int Direct,
 class Primitives<
     T, RedOp, Fan, Direct, ProtoTMA<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>, P2p, isNetOffload
   > {
+public:
+  // Profiling context
+  int profileChunkId = -1;
+
+private:
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
   static constexpr int Input=0, Output=1;
   static constexpr int RoleInput = 0x01,
@@ -247,7 +256,7 @@ class Primitives<
 
     // [TMA] Determine if TMA should be used based on test mode
     // 1: Send Only, 2: RecvSend Only, 3: Recv Only, 4: All, 5: Send,Recv, 6: Send,RecvSend
-    const int tmaMode = 1; 
+    const int tmaMode = 4; 
     bool useTma = false;
 
     // Check availability (Src present for Send, or Recv role)
@@ -307,6 +316,15 @@ class Primitives<
 
         while (slice < SlicePerChunk && offset < nelem) {
           int currSliceSize = (sliceSize < nelem-offset) ? sliceSize : nelem-offset;
+          
+          #if ENABLE_PROFILING
+          long long t0 = 0;
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+          #endif
+          
+          #if ENABLE_PROFILING
+          long long t0_slice_copy = 0;
+          #endif
 
           if (tid == 0) {
             T* userInput = (T*)ncclShmem.groups[group].userInput;
@@ -316,6 +334,17 @@ class Primitives<
           }
           waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, currSliceSize);
           subBarrier();
+
+          #if ENABLE_PROFILING
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = clock64() - t0;
+              const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
+              
+              // Reset t0_slice_copy for actual copy measurement (includes preload phase)
+              t0_slice_copy = clock64();
+          }
+          #endif
           // store srcs, dsts address
           if (tid == 0) {
             tmaSliceBaseSrc = (T*)ncclShmem.groups[group].srcs[0];
@@ -341,6 +370,10 @@ class Primitives<
             int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
             int tmaSlot = i % NCCL_TMA_PIPE_DEPTH;
             
+            #if ENABLE_PROFILING
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+            #endif
+
             if (tid == 0) {
               void* globalSrc = (void*)(tmaSliceBaseSrc + tileOffset);
               void* shmemDst = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
@@ -379,11 +412,29 @@ class Primitives<
             } else {
                tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
             }
+            #if ENABLE_PROFILING
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+                long long dt = clock64() - t0;
+                const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, i, opName, dt);
+            }
+            #endif
             tileOffset += currTileSize;
           }
 
           // [TMA] Sync before consuming tiles to ensure preload issuance is visible
           subBarrier();
+          
+          #if ENABLE_PROFILING
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = clock64() - t0_slice_copy;
+              const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY_PRE,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
+              
+              // Start timer for main loop copy
+              t0_slice_copy = clock64();
+          }
+          #endif
 
           tileOffset = 0;
           for (int t=0; t<sliceTiles; ++t) {
@@ -391,7 +442,17 @@ class Primitives<
             int tmaSlot = t % NCCL_TMA_PIPE_DEPTH;
 
             // Wait TMA
+            #if ENABLE_PROFILING
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+            #endif
             barriers[tmaSlot].wait(std::move(tmaTokens[tmaSlot]));
+            #if ENABLE_PROFILING
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = clock64() - t0;
+              const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, opName, dt);
+            }
+            #endif
 
             // Pointer swap for consumer and tile dst adjustment
             if (tid == 0) {
@@ -421,6 +482,10 @@ class Primitives<
             }
             
             // --- DUPLICATED REDUCE COPY LOGIC START ---
+            #if ENABLE_PROFILING
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+            #endif
+
             if (tid == 0) {
               TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: DirectRecv=%d DirectSend=%d Recv=%d Send=%d Src=%d Dst=%d srcs[0]=%p dsts[0]=%p dsts[1]=%p workSize=%d\n",
                               ncclShmem.comm.rank, blockIdx.x, slice, t, DirectRecv, DirectSend, Recv, Send, Src, Dst,
@@ -492,6 +557,14 @@ class Primitives<
             }
             // --- DUPLICATED REDUCE COPY LOGIC END ---
             
+            #if ENABLE_PROFILING
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+                long long dt = clock64() - t0;
+                const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_COPY,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, opName, dt);
+            }
+            #endif
+            
             #if NCCL_TMA_DEBUG
             if (tid == 0) {
               // Check if data was actually copied to dsts[0]
@@ -527,37 +600,49 @@ class Primitives<
                 
                 TMA_DEBUG_PRINT("Rank%d Block%d Refill: nextTileIdx=%d, nextSlot=%d, globalSrc=%p, shmemDst=%p, copySize=%lu\n", 
                                 ncclShmem.comm.rank, blockIdx.x, nextTileIdx, nextSlot, globalSrc, shmemDst, copySize);
-  
-                #if __CUDA_ARCH__ >= 900
-                  if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
-                      cuda::device::memcpy_async_tx(
-                          (char*)shmemDst,
-                          (char*)globalSrc,
-                          cuda::aligned_size_t<16>(copySize),
-                          barriers[nextSlot]
-                      );
-                      tmaTokens[nextSlot] = cuda::device::barrier_arrive_tx(barriers[nextSlot], 1, copySize);
-                  } else {
-                      cuda::memcpy_async(
-                          shmemDst,
-                          globalSrc,
-                          copySize,
-                          barriers[nextSlot]
-                      );
-                      tmaTokens[nextSlot] = barriers[nextSlot].arrive();
-                  }
-                #else
-                cuda::memcpy_async(
-                    shmemDst,
-                    globalSrc,
-                    copySize,
-                    barriers[nextSlot]
-                );
-                tmaTokens[nextSlot] = barriers[nextSlot].arrive();
-                #endif
-              } else {
-                tmaTokens[nextSlot] = barriers[nextSlot].arrive();
-              }
+
+              #if ENABLE_PROFILING
+              if (ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+              #endif
+
+              #if __CUDA_ARCH__ >= 900
+                if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
+                    cuda::device::memcpy_async_tx(
+                        (char*)shmemDst,
+                        (char*)globalSrc,
+                        cuda::aligned_size_t<16>(copySize),
+                        barriers[nextSlot]
+                    );
+                    tmaTokens[nextSlot] = cuda::device::barrier_arrive_tx(barriers[nextSlot], 1, copySize);
+                } else {
+                    cuda::memcpy_async(
+                        shmemDst,
+                        globalSrc,
+                        copySize,
+                        barriers[nextSlot]
+                    );
+                    tmaTokens[nextSlot] = barriers[nextSlot].arrive();
+                }
+              #else
+              cuda::memcpy_async(
+                  shmemDst,
+                  globalSrc,
+                  copySize,
+                  barriers[nextSlot]
+              );
+              tmaTokens[nextSlot] = barriers[nextSlot].arrive();
+              #endif
+
+              #if ENABLE_PROFILING
+                if (ncclShmem.channelId == 0 && profileChunkId == 0) {
+                    long long dt = clock64() - t0;
+                    const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+                    printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, nextTileIdx, opName, dt);
+                }
+              #endif
+            } else {
+              tmaTokens[nextSlot] = barriers[nextSlot].arrive();
+            }
             }
 
             tileOffset += currTileSize;
@@ -565,7 +650,27 @@ class Primitives<
 
           barrier();
           int sliceWorkSize = ncclShmem.aborted ? 0 : currSliceSize;
+
+          #if ENABLE_PROFILING
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = clock64() - t0_slice_copy;
+              const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY_MAIN,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
+          }
+          #endif
+          
+          #if ENABLE_PROFILING
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+          #endif
           postPeer<Recv, Send>(0 < sliceWorkSize);
+        
+          #if ENABLE_PROFILING
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = clock64() - t0;
+              const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_POST,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
+          }
+          #endif
 
           offset += currSliceSize;
           slice += 1;
