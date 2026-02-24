@@ -7,17 +7,8 @@
 #define NCCL_TMA_PIPE_DEPTH 2
 #define NCCL_TMA_SLOT_SIZE (32 * 1024)
 
-// TMA debugging - set to 1 to enable detailed logging, 0 to disable
-#define NCCL_TMA_DEBUG 0
-
 #ifndef ENABLE_PROFILING
 #define ENABLE_PROFILING 1
-#endif
-
-#if NCCL_TMA_DEBUG
-  #define TMA_DEBUG_PRINT(...) printf(__VA_ARGS__)
-#else
-  #define TMA_DEBUG_PRINT(...) do {} while(0)
 #endif
 
 // enum primsMode {
@@ -301,8 +292,6 @@ private:
     if (tid < nworkers && offset < nelem && !isNetOffload) {
       if (useTma) {
         if (tid == 0) {
-          TMA_DEBUG_PRINT("Rank %d Block %d: TMA Enabled. Pipe Depth %d, Slot Size %d\n", 
-                          ncclShmem.comm.rank, blockIdx.x, NCCL_TMA_PIPE_DEPTH, NCCL_TMA_SLOT_SIZE);
           #pragma unroll
           for (int i=0; i<NCCL_TMA_PIPE_DEPTH; ++i) new (&barriers[i]) tma_barrier_t(nworkers);
         }
@@ -318,8 +307,7 @@ private:
           int currSliceSize = (sliceSize < nelem-offset) ? sliceSize : nelem-offset;
           
           #if ENABLE_PROFILING
-          long long t0 = 0;
-          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+          long long t0 = clock64();
           #endif
           
           #if ENABLE_PROFILING
@@ -336,14 +324,14 @@ private:
           subBarrier();
 
           #if ENABLE_PROFILING
+          long long t1_wait = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = clock64() - t0;
+              long long dt = t1_wait - t0;
               const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
               printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
-              
-              // Reset t0_slice_copy for actual copy measurement (includes preload phase)
-              t0_slice_copy = clock64();
           }
+          // Reset t0_slice_copy for actual copy measurement (includes preload phase)
+          t0_slice_copy = clock64();
           #endif
           // store srcs, dsts address
           if (tid == 0) {
@@ -363,15 +351,12 @@ private:
           int preloadCount = min(NCCL_TMA_PIPE_DEPTH, sliceTiles);
           int tileOffset = 0;
           
-          TMA_DEBUG_PRINT("Rank%d Block%d slice=%d: currSliceSize=%d, tmaTileSize=%d, sliceTiles=%d, preloadCount=%d\n", 
-                          ncclShmem.comm.rank, blockIdx.x, slice, currSliceSize, tmaTileSize, sliceTiles, preloadCount);
-
           for (int i=0; i<preloadCount; ++i) {
             int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
             int tmaSlot = i % NCCL_TMA_PIPE_DEPTH;
             
             #if ENABLE_PROFILING
-            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+            t0 = clock64();
             #endif
 
             if (tid == 0) {
@@ -413,8 +398,9 @@ private:
                tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
             }
             #if ENABLE_PROFILING
+            long long t1_issue = clock64();
             if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-                long long dt = clock64() - t0;
+                long long dt = t1_issue - t0;
                 const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
                 printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, i, opName, dt);
             }
@@ -426,8 +412,9 @@ private:
           subBarrier();
           
           #if ENABLE_PROFILING
+          long long t1_copy_pre = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = clock64() - t0_slice_copy;
+              long long dt = t1_copy_pre - t0_slice_copy;
               const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
               printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY_PRE,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
               
@@ -447,8 +434,9 @@ private:
             #endif
             barriers[tmaSlot].wait(std::move(tmaTokens[tmaSlot]));
             #if ENABLE_PROFILING
+            long long t1 = clock64();
             if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = clock64() - t0;
+              long long dt = t1 - t0;
               const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
               printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, opName, dt);
             }
@@ -472,25 +460,13 @@ private:
             subBarrier();
 
             int workSize = ncclShmem.aborted ? 0 : currTileSize;
-            if (tid == 0) {
-              #if NCCL_TMA_DEBUG
-                float val = (float)((float*)ncclShmem.groups[group].srcs[0])[0];
-                TMA_DEBUG_PRINT("Rank%d Block%d Consume t=%d slot=%d Srcs0=%p ValSmem=%f Dsts0=%p Sz=%d tileOffset=%d\n", 
-                                ncclShmem.comm.rank, blockIdx.x, t, tmaSlot, ncclShmem.groups[group].srcs[0], val, 
-                                ncclShmem.groups[group].dsts[0], workSize, tileOffset);
-              #endif
-            }
             
             // --- DUPLICATED REDUCE COPY LOGIC START ---
             #if ENABLE_PROFILING
-            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+            t0 = clock64();
             #endif
 
             if (tid == 0) {
-              TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: DirectRecv=%d DirectSend=%d Recv=%d Send=%d Src=%d Dst=%d srcs[0]=%p dsts[0]=%p dsts[1]=%p workSize=%d\n",
-                              ncclShmem.comm.rank, blockIdx.x, slice, t, DirectRecv, DirectSend, Recv, Send, Src, Dst,
-                              ncclShmem.groups[group].srcs[0], ncclShmem.groups[group].dsts[0],
-                              (Send && Dst ? ncclShmem.groups[group].dsts[1] : nullptr), workSize);
             }
             
             if (flags & AnyNetDeviceUnpack) {
@@ -500,10 +476,6 @@ private:
 
             if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
                 && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
-              if (tid == 0) {
-                TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: BRANCH 1 - DirectRecv path\n", 
-                                ncclShmem.comm.rank, blockIdx.x, slice, t);
-              }
               if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
                 reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
                   (tid, nworkers, /*redArg*/0, /*postOp*/false,
@@ -512,10 +484,6 @@ private:
                   workSize);
               }
             } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
-              if (tid == 0) {
-                TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: BRANCH 2 - DirectSend path\n", 
-                                ncclShmem.comm.rank, blockIdx.x, slice, t);
-              }
               reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
                 (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
                 Recv, ncclShmem.groups[group].srcs,
@@ -524,10 +492,6 @@ private:
             } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
               constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
               if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
-                if (tid == 0) {
-                  TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: BRANCH 3a - Send && Dst && dsts[1]==nullptr\n", 
-                                  ncclShmem.comm.rank, blockIdx.x, slice, t);
-                }
                 reduceCopyShared<Unroll, RedOp, T,
                   0, Recv + Src, Recv * MaxRecv + Src,
                   0, 1, 1, PreOpSrcs>
@@ -536,10 +500,6 @@ private:
                     1, ncclShmem.groups[group].dsts,
                     workSize);
               } else {
-                if (tid == 0) {
-                  TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: BRANCH 3b - General path (MultimemSrcs=%d MultimemDsts=%d)\n", 
-                                  ncclShmem.comm.rank, blockIdx.x, slice, t, MultimemSrcs, MultimemDsts);
-                }
                 reduceCopyShared<Unroll, RedOp, T,
                   MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
                   MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
@@ -550,40 +510,18 @@ private:
               }
             } else {
               workSize = 0;
-              if (tid == 0) {
-                TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: NO BRANCH MATCHED - setting workSize=0\n", 
-                                ncclShmem.comm.rank, blockIdx.x, slice, t);
-              }
             }
             // --- DUPLICATED REDUCE COPY LOGIC END ---
             
             #if ENABLE_PROFILING
+            long long t1_copy = clock64();
             if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-                long long dt = clock64() - t0;
+                long long dt = t1_copy - t0;
                 const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
                 printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_COPY,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, opName, dt);
             }
             #endif
             
-            #if NCCL_TMA_DEBUG
-            if (tid == 0) {
-              // Check if data was actually copied to dsts[0]
-              float* dstPtr = (float*)ncclShmem.groups[group].dsts[0];
-              if (dstPtr) {
-                float dstVal = dstPtr[0];
-                TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: After reduceCopyShared - dsts[0][0]=%f (expected val)\n", 
-                                ncclShmem.comm.rank, blockIdx.x, slice, t, dstVal);
-              }
-              // Check peer FIFO (dsts[1])
-              if (Send && Dst && ncclShmem.groups[group].dsts[1]) {
-                float* peerPtr = (float*)ncclShmem.groups[group].dsts[1];
-                float peerVal = peerPtr[0];
-                TMA_DEBUG_PRINT("Rank%d Block%d slice=%d t=%d: After reduceCopyShared - dsts[1][0]=%f (peer FIFO)\n", 
-                                ncclShmem.comm.rank, blockIdx.x, slice, t, peerVal);
-              }
-            }
-            #endif
-
             subBarrier();
             
             /* [TMA] Refill after consumption to ensure slot is free */
@@ -598,11 +536,8 @@ private:
                 void* shmemDst = (char*)ncclTmaShmemPtr() + nextSlot * NCCL_TMA_SLOT_SIZE;
                 size_t copySize = nextTileSize * sizeof(T);
                 
-                TMA_DEBUG_PRINT("Rank%d Block%d Refill: nextTileIdx=%d, nextSlot=%d, globalSrc=%p, shmemDst=%p, copySize=%lu\n", 
-                                ncclShmem.comm.rank, blockIdx.x, nextTileIdx, nextSlot, globalSrc, shmemDst, copySize);
-
               #if ENABLE_PROFILING
-              if (ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+              t0 = clock64();
               #endif
 
               #if __CUDA_ARCH__ >= 900
@@ -634,8 +569,9 @@ private:
               #endif
 
               #if ENABLE_PROFILING
+                long long t1_issue_refill = clock64();
                 if (ncclShmem.channelId == 0 && profileChunkId == 0) {
-                    long long dt = clock64() - t0;
+                    long long dt = t1_issue_refill - t0;
                     const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
                     printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, nextTileIdx, opName, dt);
                 }
@@ -652,21 +588,23 @@ private:
           int sliceWorkSize = ncclShmem.aborted ? 0 : currSliceSize;
 
           #if ENABLE_PROFILING
+          long long t1_copy_main = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = clock64() - t0_slice_copy;
+              long long dt = t1_copy_main - t0_slice_copy;
               const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
               printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY_MAIN,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
           #endif
           
           #if ENABLE_PROFILING
-          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+          t0 = clock64();
           #endif
           postPeer<Recv, Send>(0 < sliceWorkSize);
         
           #if ENABLE_PROFILING
+          long long t1_post = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = clock64() - t0;
+              long long dt = t1_post - t0;
               const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
               printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_POST,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
