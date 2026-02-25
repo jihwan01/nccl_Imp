@@ -417,10 +417,9 @@ private:
               long long dt = t1_copy_pre - t0_slice_copy;
               const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
               printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY_PRE,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
-              
-              // Start timer for main loop copy
-              t0_slice_copy = clock64();
           }
+          // Start timer for main loop copy.
+          t0_slice_copy = clock64();
           #endif
 
           tileOffset = 0;
@@ -430,7 +429,7 @@ private:
 
             // Wait TMA
             #if ENABLE_PROFILING
-            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) t0 = clock64();
+            t0 = clock64();
             #endif
             barriers[tmaSlot].wait(std::move(tmaTokens[tmaSlot]));
             #if ENABLE_PROFILING
@@ -624,8 +623,23 @@ private:
             if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
             if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
           }
+
+#if ENABLE_PROFILING
+          long long t0 = clock64();
+#endif
+
           waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
           subBarrier();
+
+#if ENABLE_PROFILING
+          long long t1_wait = clock64();
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+            long long dt = t1_wait - t0;
+            const char* opName = (Send && Recv) ? "COPY" : (Send ? "SEND" : "RECV");
+            printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
+          }
+          t0 = clock64();
+#endif
         
           int workSize = ncclShmem.aborted ? 0 : sliceSize;
           if (flags & AnyNetDeviceUnpack) {
@@ -670,9 +684,29 @@ private:
           } else {
             workSize = 0;
           }
-          barrier(); 
-          /* workSize undefined error fix: workSize is declared inside the loop above */
+          barrier();
+
+#if ENABLE_PROFILING
+          long long t1_copy = clock64();
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+            long long dt = t1_copy - t0;
+            const char* opName = (Send && Recv) ? "COPY" : (Send ? "SEND" : "RECV");
+            printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
+          }
+          t0 = clock64();
+#endif
+
           postPeer<Recv, Send>(0 < workSize);
+
+#if ENABLE_PROFILING
+          long long t1_post = clock64();
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+            long long dt = t1_post - t0;
+            const char* opName = (Send && Recv) ? "COPY" : (Send ? "SEND" : "RECV");
+            printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_POST,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
+          }
+#endif
+
           offset += sliceSize;
           slice += 1;
         } while (slice < SlicePerChunk && offset < nelem);
