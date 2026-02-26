@@ -247,7 +247,7 @@ private:
 
     // [TMA] Determine if TMA should be used based on test mode
     // 1: Send Only, 2: RecvSend Only, 3: Recv Only, 4: All, 5: Send,Recv, 6: Send,RecvSend
-    const int tmaMode = 4; 
+    const int tmaMode = 7; 
     bool useTma = false;
 
     // Check availability (Src present for Send, or Recv role)
@@ -363,9 +363,6 @@ private:
               void* globalSrc = (void*)(tmaSliceBaseSrc + tileOffset);
               void* shmemDst = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
               size_t copySize = currTileSize * sizeof(T);
-              
-              TMA_DEBUG_PRINT("Rank%d Block%d Preload i=%d slot=%d GSrc=%p SDst=%p Sz=%lu ValSrc=%f\n", 
-                              ncclShmem.comm.rank, blockIdx.x, i, tmaSlot, globalSrc, shmemDst, copySize, (float)((float*)globalSrc)[0]);
               
               #if __CUDA_ARCH__ >= 900
                 if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
