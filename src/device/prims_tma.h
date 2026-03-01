@@ -10,6 +10,12 @@
 #ifndef ENABLE_PROFILING
 #define ENABLE_PROFILING 1
 #endif
+#ifndef ENABLE_TILE_PROFILING
+#define ENABLE_TILE_PROFILING ENABLE_PROFILING
+#endif
+#ifndef ENABLE_SLICE_PROFILING
+#define ENABLE_SLICE_PROFILING ENABLE_PROFILING
+#endif
 
 // enum primsMode {
 //   primsModeDefault = 0,
@@ -315,9 +321,12 @@ private:
         while (slice < SlicePerChunk && offset < nelem) {
           int currSliceSize = (sliceSize < nelem-offset) ? sliceSize : nelem-offset;
           
-          #if ENABLE_PROFILING
-          long long t0 = clock64();
+          #if ENABLE_TILE_PROFILING || ENABLE_SLICE_PROFILING
+          long long t0 = 0;
+          #endif
+          #if ENABLE_SLICE_PROFILING
           long long t0_slice_copy = 0;
+          t0 = clock64();
           #endif
 
           if (tid == 0) {
@@ -329,7 +338,7 @@ private:
           waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, currSliceSize);
           subBarrier();
 
-          #if ENABLE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           long long t1_wait = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
               long long dt = t1_wait - t0;
@@ -339,6 +348,11 @@ private:
           // Reset t0_slice_copy for actual copy measurement (includes preload phase)
           t0_slice_copy = clock64();
           #endif
+
+          // ================================================================
+          // =================== ReduceCopy or Copy Phase ===================
+          // ================================================================
+
           // Store slice base pointers once waitPeer/setup is complete.
           tmaSliceBaseSrc = (T*)ncclShmem.groups[group].srcs[0];
           tmaSliceBaseDst = (T*)ncclShmem.groups[group].dsts[0];
@@ -354,6 +368,11 @@ private:
           int sliceTiles = (currSliceSize + tmaTileSize - 1) / tmaTileSize;
           int preloadCount = min(NCCL_TMA_PIPE_DEPTH, sliceTiles);
           int tileOffset = 0;
+
+          // ================================================================
+          // =================== Preload Phase ===================
+          // ================================================================
+
           if (isTmaIssuerThread) {
             for (int i=0; i<preloadCount; ++i) {
               int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
@@ -362,7 +381,7 @@ private:
               void* shmemDst = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
               size_t copySize = currTileSize * sizeof(T);
 
-              #if ENABLE_PROFILING
+              #if ENABLE_TILE_PROFILING
               t0 = clock64();
               #endif
 
@@ -393,7 +412,7 @@ private:
               );
               tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
               #endif
-              #if ENABLE_PROFILING
+              #if ENABLE_TILE_PROFILING
               long long t1_issue = clock64();
               if (ncclShmem.channelId == 0 && profileChunkId == 0) {
                 long long dt = t1_issue - t0;
@@ -413,7 +432,7 @@ private:
 
           // [TMA] Preload sync is covered by per-slot barrier wait in the tile loop.
 
-          #if ENABLE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           long long t1_copy_pre = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
               long long dt = t1_copy_pre - t0_slice_copy;
@@ -424,17 +443,22 @@ private:
           t0_slice_copy = clock64();
           #endif
 
+          // ================================================================
+          // =================== Main Loop Phase ===================
+          // ================================================================
+
+
           tileOffset = 0;
           for (int t=0; t<sliceTiles; ++t) {
             int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
             int tmaSlot = t % NCCL_TMA_PIPE_DEPTH;
 
             // Wait TMA
-            #if ENABLE_PROFILING
+            #if ENABLE_TILE_PROFILING
             t0 = clock64();
             #endif
             barriers[tmaSlot].wait(std::move(tmaTokens[tmaSlot]));
-            #if ENABLE_PROFILING
+            #if ENABLE_TILE_PROFILING
             long long t1 = clock64();
             if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
               long long dt = t1 - t0;
@@ -480,7 +504,7 @@ private:
             int workSize = ncclShmem.aborted ? 0 : currTileSize;
             
             // --- DUPLICATED REDUCE COPY LOGIC START ---
-            #if ENABLE_PROFILING
+            #if ENABLE_TILE_PROFILING
             t0 = clock64();
             #endif
 
@@ -532,7 +556,7 @@ private:
             }
             // --- DUPLICATED REDUCE COPY LOGIC END ---
             
-            #if ENABLE_PROFILING
+            #if ENABLE_TILE_PROFILING
             long long t1_copy = clock64();
             if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
                 long long dt = t1_copy - t0;
@@ -545,7 +569,7 @@ private:
               void* globalSrc = (void*)(tmaSliceBaseSrc + issueOffset);
               void* shmemDst = (char*)ncclTmaShmemPtr() + issueSlot * NCCL_TMA_SLOT_SIZE;
               size_t copySize = issueTileSize * sizeof(T);
-              #if ENABLE_PROFILING
+              #if ENABLE_TILE_PROFILING
               t0 = clock64();
               #endif
               #if __CUDA_ARCH__ >= 900
@@ -575,7 +599,7 @@ private:
               );
               tmaTokens[issueSlot] = barriers[issueSlot].arrive();
               #endif
-              #if ENABLE_PROFILING
+              #if ENABLE_TILE_PROFILING
               long long t1_issue_overlap = clock64();
               if (ncclShmem.channelId == 0 && profileChunkId == 0) {
                 long long dt = t1_issue_overlap - t0;
@@ -591,7 +615,7 @@ private:
           barrier();
           int sliceWorkSize = ncclShmem.aborted ? 0 : currSliceSize;
 
-          #if ENABLE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           long long t1_copy_main = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
               long long dt = t1_copy_main - t0_slice_copy;
@@ -600,12 +624,12 @@ private:
           }
           #endif
           
-          #if ENABLE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           t0 = clock64();
           #endif
           postPeer<Recv, Send>(0 < sliceWorkSize);
         
-          #if ENABLE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           long long t1_post = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
               long long dt = t1_post - t0;
@@ -629,14 +653,14 @@ private:
             if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
           }
 
-#if ENABLE_PROFILING
+#if ENABLE_SLICE_PROFILING
           long long t0 = clock64();
 #endif
 
           waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
           subBarrier();
 
-#if ENABLE_PROFILING
+#if ENABLE_SLICE_PROFILING
           long long t1_wait = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_wait - t0;
@@ -691,7 +715,7 @@ private:
           }
           barrier();
 
-#if ENABLE_PROFILING
+#if ENABLE_SLICE_PROFILING
           long long t1_copy = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_copy - t0;
@@ -703,7 +727,7 @@ private:
 
           postPeer<Recv, Send>(0 < workSize);
 
-#if ENABLE_PROFILING
+#if ENABLE_SLICE_PROFILING
           long long t1_post = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_post - t0;
