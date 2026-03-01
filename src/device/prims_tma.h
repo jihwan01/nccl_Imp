@@ -253,7 +253,7 @@ private:
 
     // [TMA] Determine if TMA should be used based on test mode
     // 1: Send Only, 2: RecvSend Only, 3: Recv Only, 4: All, 5: Send,Recv, 6: Send,RecvSend
-    const int tmaMode = 7; 
+    const int tmaMode = 4; 
     bool useTma = false;
 
     // Check availability (Src present for Send, or Recv role)
@@ -610,6 +610,9 @@ private:
             }
             
             tileOffset += currTileSize;
+            // Ensure all workers have finished consuming this tile before tid0
+            // updates shared srcs/dsts pointers for the next tile.
+            subBarrier();
           }
 
           barrier();
