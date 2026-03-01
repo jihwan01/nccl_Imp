@@ -328,6 +328,14 @@ private:
           long long t0_slice_copy = 0;
           t0 = clock64();
           #endif
+          #if ENABLE_TILE_PROFILING
+          long long tileWaitSum = 0;
+          long long tileCopyCoreSum = 0;
+          long long tileConsumeSum = 0;
+          long long tileStepSum = 0;
+          long long tileIssueEnqPreloadSum = 0;
+          long long tileIssueEnqOverlapSum = 0;
+          #endif
 
           if (tid == 0) {
             T* userInput = (T*)ncclShmem.groups[group].userInput;
@@ -417,7 +425,8 @@ private:
               if (ncclShmem.channelId == 0 && profileChunkId == 0) {
                 long long dt = t1_issue - t0;
                 const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
-                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, i, opName, dt);
+                tileIssueEnqPreloadSum += dt;
+                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE_ENQ_PRELOAD,%lld\n", ncclShmem.channelId, profileChunkId, slice, i, opName, dt);
               }
               #endif
               tileOffset += currTileSize;
@@ -452,19 +461,21 @@ private:
           for (int t=0; t<sliceTiles; ++t) {
             int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
             int tmaSlot = t % NCCL_TMA_PIPE_DEPTH;
+            #if ENABLE_TILE_PROFILING
+            const char* tileOpName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+            long long tTileIterStart = clock64();
+            #endif
 
             // Wait TMA
-            #if ENABLE_TILE_PROFILING
-            t0 = clock64();
-            #endif
             barriers[tmaSlot].wait(std::move(tmaTokens[tmaSlot]));
             #if ENABLE_TILE_PROFILING
-            long long t1 = clock64();
+            long long tAfterWait = clock64();
             if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = t1 - t0;
-              const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
-              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, opName, dt);
+              long long dt = tAfterWait - tTileIterStart;
+              tileWaitSum += dt;
+              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
             }
+            long long tConsumeStart = tAfterWait;
             #endif
 
             // Pointer swap for consumer and tile dst adjustment
@@ -505,7 +516,7 @@ private:
             
             // --- DUPLICATED REDUCE COPY LOGIC START ---
             #if ENABLE_TILE_PROFILING
-            t0 = clock64();
+            long long tCopyCoreStart = clock64();
             #endif
 
             if (flags & AnyNetDeviceUnpack) {
@@ -557,11 +568,11 @@ private:
             // --- DUPLICATED REDUCE COPY LOGIC END ---
             
             #if ENABLE_TILE_PROFILING
-            long long t1_copy = clock64();
+            long long tCopyCoreEnd = clock64();
             if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-                long long dt = t1_copy - t0;
-                const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
-                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_COPY,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, opName, dt);
+                long long dt = tCopyCoreEnd - tCopyCoreStart;
+                tileCopyCoreSum += dt;
+                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_COPY_CORE,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
             }
             #endif
 
@@ -570,7 +581,7 @@ private:
               void* shmemDst = (char*)ncclTmaShmemPtr() + issueSlot * NCCL_TMA_SLOT_SIZE;
               size_t copySize = issueTileSize * sizeof(T);
               #if ENABLE_TILE_PROFILING
-              t0 = clock64();
+              long long tIssueStart = clock64();
               #endif
               #if __CUDA_ARCH__ >= 900
                 if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
@@ -602,9 +613,10 @@ private:
               #if ENABLE_TILE_PROFILING
               long long t1_issue_overlap = clock64();
               if (ncclShmem.channelId == 0 && profileChunkId == 0) {
-                long long dt = t1_issue_overlap - t0;
-                const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
-                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, issueTileIdx, opName, dt);
+                long long dt = t1_issue_overlap - tIssueStart;
+                const char* issueOpName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+                tileIssueEnqOverlapSum += dt;
+                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE_ENQ_OVERLAP,%lld\n", ncclShmem.channelId, profileChunkId, slice, issueTileIdx, issueOpName, dt);
               }
               #endif
             }
@@ -613,7 +625,34 @@ private:
             // Ensure all workers have finished consuming this tile before tid0
             // updates shared srcs/dsts pointers for the next tile.
             subBarrier();
+            #if ENABLE_TILE_PROFILING
+            long long tTileIterEnd = clock64();
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long consumeDt = tTileIterEnd - tConsumeStart;
+              long long stepDt = tTileIterEnd - tTileIterStart;
+              tileConsumeSum += consumeDt;
+              tileStepSum += stepDt;
+              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_CONSUME,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, consumeDt);
+              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_STEP,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, stepDt);
+            }
+            #endif
           }
+
+          #if ENABLE_TILE_PROFILING
+          if (ncclShmem.channelId == 0 && profileChunkId == 0) {
+            const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+            if (tid == 0) {
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_TILE_WAIT_SUM,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, tileWaitSum);
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_TILE_COPY_CORE_SUM,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, tileCopyCoreSum);
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_TILE_CONSUME_SUM,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, tileConsumeSum);
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_TILE_STEP_SUM,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, tileStepSum);
+            }
+            if (isTmaIssuerThread) {
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_TILE_ISSUE_ENQ_PRELOAD_SUM,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, tileIssueEnqPreloadSum);
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_TILE_ISSUE_ENQ_OVERLAP_SUM,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, tileIssueEnqOverlapSum);
+            }
+          }
+          #endif
 
           barrier();
           int sliceWorkSize = ncclShmem.aborted ? 0 : currSliceSize;
@@ -667,7 +706,7 @@ private:
           long long t1_wait = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_wait - t0;
-            const char* opName = (Send && Recv) ? "COPY" : (Send ? "SEND" : "RECV");
+            const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
             printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
           t0 = clock64();
@@ -722,7 +761,7 @@ private:
           long long t1_copy = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_copy - t0;
-            const char* opName = (Send && Recv) ? "COPY" : (Send ? "SEND" : "RECV");
+            const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
             printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
           t0 = clock64();
@@ -734,7 +773,7 @@ private:
           long long t1_post = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_post - t0;
-            const char* opName = (Send && Recv) ? "COPY" : (Send ? "SEND" : "RECV");
+            const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
             printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_POST,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
 #endif
