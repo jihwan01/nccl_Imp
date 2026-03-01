@@ -146,7 +146,10 @@ def main():
 
 
     date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_name = args.output if args.output else f"nccl_profile_{date_str}_{meta['Protocol']}_{meta['Size']}_{meta['GPUs']}gpu.xlsx"
+    default_name = f"nccl_profile_{date_str}_{meta['Protocol']}_{meta['Size']}_{meta['GPUs']}gpu.xlsx"
+    # Default output directory follows the input log location, not current cwd.
+    log_dir = os.path.dirname(os.path.abspath(args.logfile))
+    out_name = args.output if args.output else os.path.join(log_dir, default_name)
     if not out_name.endswith('.xlsx'):
         out_name += '.xlsx'
     
