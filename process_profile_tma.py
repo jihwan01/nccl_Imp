@@ -124,14 +124,31 @@ def main():
 
     # 2. Slice Data
     if not df_slice.empty:
-        df_slice = df_slice.sort_values(by=['ChunkNum', 'SliceNum', 'Channel', 'BlockType'])
-        dfs_to_save['Slice_Raw'] = df_slice
-        
-        slice_summary_ch = df_slice.groupby(['Channel', 'ChunkNum', 'SliceNum', 'BlockType'])[time_col].agg(['mean', 'max', 'min', 'count']).reset_index()
-        dfs_to_save['Slice_Summary_Channel'] = slice_summary_ch
+        # Keep tile-aggregate slice lines separate from regular slice profiling.
+        # e.g. RECVSEND_TILE_WAIT_SUM, RECVSEND_TILE_STEP_SUM, ...
+        is_tile_agg = df_slice['BlockType'].str.contains(r'_TILE_', regex=True)
+        df_slice_regular = df_slice[~is_tile_agg].copy()
+        df_slice_tileagg = df_slice[is_tile_agg].copy()
 
-        slice_summary_global = df_slice.groupby(['BlockType'])[time_col].agg(['mean', 'max', 'min', 'count']).reset_index()
-        dfs_to_save['Slice_Summary_Global'] = slice_summary_global
+        if not df_slice_regular.empty:
+            df_slice_regular = df_slice_regular.sort_values(by=['ChunkNum', 'SliceNum', 'Channel', 'BlockType'])
+            dfs_to_save['Slice_Raw'] = df_slice_regular
+            
+            slice_summary_ch = df_slice_regular.groupby(['Channel', 'ChunkNum', 'SliceNum', 'BlockType'])[time_col].agg(['mean', 'max', 'min', 'count']).reset_index()
+            dfs_to_save['Slice_Summary_Channel'] = slice_summary_ch
+
+            slice_summary_global = df_slice_regular.groupby(['BlockType'])[time_col].agg(['mean', 'max', 'min', 'count']).reset_index()
+            dfs_to_save['Slice_Summary_Global'] = slice_summary_global
+
+        if not df_slice_tileagg.empty:
+            df_slice_tileagg = df_slice_tileagg.sort_values(by=['ChunkNum', 'SliceNum', 'Channel', 'BlockType'])
+            dfs_to_save['Slice_TileAgg_Raw'] = df_slice_tileagg
+
+            slice_tileagg_ch = df_slice_tileagg.groupby(['Channel', 'ChunkNum', 'SliceNum', 'BlockType'])[time_col].agg(['mean', 'max', 'min', 'count']).reset_index()
+            dfs_to_save['Slice_TileAgg_Summary_Channel'] = slice_tileagg_ch
+
+            slice_tileagg_global = df_slice_tileagg.groupby(['BlockType'])[time_col].agg(['mean', 'max', 'min', 'count']).reset_index()
+            dfs_to_save['Slice_TileAgg_Summary_Global'] = slice_tileagg_global
 
     # 3. Tile Data
     if not df_tile.empty:
