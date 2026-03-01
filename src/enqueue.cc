@@ -2015,9 +2015,12 @@ static ncclResult_t topoGetAlgoInfo(
       else break;
     }
   }
-  if (info->protocol == NCCL_PROTO_SIMPLE || info->protocol == NCCL_PROTO_TMA) {
+  if (info->protocol == NCCL_PROTO_SIMPLE) {
     if (info->algorithm == NCCL_ALGO_RING) nt += WARP_SIZE; // Extra warp for sync
     // More threads or sync warps needed due to split thread model
+    if (info->algorithm == NCCL_ALGO_TREE) nt += 4*WARP_SIZE;
+  } else if (info->protocol == NCCL_PROTO_TMA) {
+    if (info->algorithm == NCCL_ALGO_RING) nt += 2*WARP_SIZE; // Extra warps for sync + TMA issue specialization
     if (info->algorithm == NCCL_ALGO_TREE) nt += 4*WARP_SIZE;
   }
   nt = nt/WARP_SIZE < 3 ? 3*WARP_SIZE : nt;

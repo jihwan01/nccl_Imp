@@ -288,6 +288,15 @@ private:
     __shared__ alignas(alignof(tma_barrier_t)) char barrierMem[sizeof(tma_barrier_t) * NCCL_TMA_PIPE_DEPTH];
     tma_barrier_t* barriers = reinterpret_cast<tma_barrier_t*>(barrierMem);
     typename tma_barrier_t::arrival_token tmaTokens[NCCL_TMA_PIPE_DEPTH];
+    // Warp specialization for TMA issue:
+    // Only enable when fan-in/out is 1 (ring-like path), then reserve the last
+    // worker warp for issuing TMA copies while earlier worker warps keep computing.
+    constexpr bool TmaIssueWarpEligible = (MaxRecv <= 1 && MaxSend <= 1);
+    const int tmaComputeWorkers = (TmaIssueWarpEligible && nworkers >= 2*WARP_SIZE) ? (nworkers - WARP_SIZE) : nworkers;
+    const bool tmaIssueWarpEnabled = (tmaComputeWorkers < nworkers);
+    const int tmaIssueTid = tmaComputeWorkers;
+    const bool isTmaComputeThread = tid < tmaComputeWorkers;
+    const bool isTmaIssuerThread = tmaIssueWarpEnabled ? (tid == tmaIssueTid) : (tid == 0);
 
     if (tid < nworkers && offset < nelem && !isNetOffload) {
       if (useTma) {
@@ -308,9 +317,6 @@ private:
           
           #if ENABLE_PROFILING
           long long t0 = clock64();
-          #endif
-          
-          #if ENABLE_PROFILING
           long long t0_slice_copy = 0;
           #endif
 
@@ -333,37 +339,33 @@ private:
           // Reset t0_slice_copy for actual copy measurement (includes preload phase)
           t0_slice_copy = clock64();
           #endif
-          // store srcs, dsts address
-          if (tid == 0) {
-            tmaSliceBaseSrc = (T*)ncclShmem.groups[group].srcs[0];
-            tmaSliceBaseDst = (T*)ncclShmem.groups[group].dsts[0];
-            // Save base pointer for dsts[1] (peer FIFO) if Send path
-            if (Send && Dst && ncclShmem.groups[group].dsts[1] != nullptr) {
-              peerFifoBase = (T*)ncclShmem.groups[group].dsts[1];
-            }
-            // Save base pointer for srcs[1] (peer FIFO) if Recv path
-            if (Recv && Src && ncclShmem.groups[group].srcs[1] != nullptr) {
-              peerSrcBase = (T*)ncclShmem.groups[group].srcs[1];
-            }
+          // Store slice base pointers once waitPeer/setup is complete.
+          tmaSliceBaseSrc = (T*)ncclShmem.groups[group].srcs[0];
+          tmaSliceBaseDst = (T*)ncclShmem.groups[group].dsts[0];
+          // Save base pointer for dsts[1] (peer FIFO) if Send path
+          if (Send && Dst && ncclShmem.groups[group].dsts[1] != nullptr) {
+            peerFifoBase = (T*)ncclShmem.groups[group].dsts[1];
+          }
+          // Save base pointer for srcs[1] (peer FIFO) if Recv path
+          if (Recv && Src && ncclShmem.groups[group].srcs[1] != nullptr) { // For operation involving reduce operation
+            peerSrcBase = (T*)ncclShmem.groups[group].srcs[1];
           }
 
           int sliceTiles = (currSliceSize + tmaTileSize - 1) / tmaTileSize;
           int preloadCount = min(NCCL_TMA_PIPE_DEPTH, sliceTiles);
           int tileOffset = 0;
-          
-          for (int i=0; i<preloadCount; ++i) {
-            int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
-            int tmaSlot = i % NCCL_TMA_PIPE_DEPTH;
-            
-            #if ENABLE_PROFILING
-            t0 = clock64();
-            #endif
-
-            if (tid == 0) {
+          if (isTmaIssuerThread) {
+            for (int i=0; i<preloadCount; ++i) {
+              int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
+              int tmaSlot = i % NCCL_TMA_PIPE_DEPTH;
               void* globalSrc = (void*)(tmaSliceBaseSrc + tileOffset);
               void* shmemDst = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
               size_t copySize = currTileSize * sizeof(T);
-              
+
+              #if ENABLE_PROFILING
+              t0 = clock64();
+              #endif
+
               #if __CUDA_ARCH__ >= 900
                 if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
                   cuda::device::memcpy_async_tx(
@@ -391,23 +393,26 @@ private:
               );
               tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
               #endif
-            } else {
-               tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
-            }
-            #if ENABLE_PROFILING
-            long long t1_issue = clock64();
-            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              #if ENABLE_PROFILING
+              long long t1_issue = clock64();
+              if (ncclShmem.channelId == 0 && profileChunkId == 0) {
                 long long dt = t1_issue - t0;
                 const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
                 printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, i, opName, dt);
+              }
+              #endif
+              tileOffset += currTileSize;
             }
-            #endif
-            tileOffset += currTileSize;
+          } else {
+            // Non-issuer threads still contribute to slot handoff counts.
+            for (int i=0; i<preloadCount; ++i) {
+              int tmaSlot = i % NCCL_TMA_PIPE_DEPTH;
+              tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
+            }
           }
 
-          // [TMA] Sync before consuming tiles to ensure preload issuance is visible
-          subBarrier();
-          
+          // [TMA] Preload sync is covered by per-slot barrier wait in the tile loop.
+
           #if ENABLE_PROFILING
           long long t1_copy_pre = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
@@ -455,6 +460,23 @@ private:
             }
             subBarrier();
 
+            // In specialized mode, issue(t+depth-1) to overlap with current consume.
+            // Without specialization, keep the original refill schedule issue(t+depth).
+            int issueTileIdx = t + (tmaIssueWarpEnabled ? (NCCL_TMA_PIPE_DEPTH - 1) : NCCL_TMA_PIPE_DEPTH);
+            bool overlapIssue = issueTileIdx < sliceTiles;
+            if (tmaIssueWarpEnabled) overlapIssue &= issueTileIdx >= preloadCount;
+            int issueOffset = 0;
+            int issueTileSize = 0;
+            int issueSlot = 0;
+            if (overlapIssue) {
+              issueOffset = issueTileIdx * tmaTileSize;
+              issueTileSize = (tmaTileSize < currSliceSize - issueOffset) ? tmaTileSize : currSliceSize - issueOffset;
+              issueSlot = issueTileIdx % NCCL_TMA_PIPE_DEPTH;
+              if (!isTmaIssuerThread) {
+                tmaTokens[issueSlot] = barriers[issueSlot].arrive(); //
+              }
+            }
+
             int workSize = ncclShmem.aborted ? 0 : currTileSize;
             
             // --- DUPLICATED REDUCE COPY LOGIC START ---
@@ -462,50 +484,51 @@ private:
             t0 = clock64();
             #endif
 
-            if (tid == 0) {
-            }
-            
             if (flags & AnyNetDeviceUnpack) {
-              ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+              if (isTmaComputeThread) {
+                ncclNetDeviceUnpack<Recv>(tid, tidInBlock, tmaComputeWorkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+              }
               subBarrier();
             }
 
-            if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
-                && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
-              if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
-                reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
-                  (tid, nworkers, /*redArg*/0, /*postOp*/false,
-                  1, ncclShmem.groups[group].srcs,
-                  fan.nsend(), ncclShmem.groups[group].dsts+1,
+            if (isTmaComputeThread) {
+              if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
+                  && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
+                if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
+                  reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                    (tid, tmaComputeWorkers, /*redArg*/0, /*postOp*/false,
+                    1, ncclShmem.groups[group].srcs,
+                    fan.nsend(), ncclShmem.groups[group].dsts+1,
+                    workSize);
+                }
+              } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
+                reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+                  (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                  Recv, ncclShmem.groups[group].srcs,
+                  Dst, ncclShmem.groups[group].dsts,
                   workSize);
-              }
-            } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
-              reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
-                (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
-                Recv, ncclShmem.groups[group].srcs,
-                Dst, ncclShmem.groups[group].dsts,
-                workSize);
-            } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
-              constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
-              if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
-                reduceCopyShared<Unroll, RedOp, T,
-                  0, Recv + Src, Recv * MaxRecv + Src,
-                  0, 1, 1, PreOpSrcs>
-                  (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
-                    Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                    1, ncclShmem.groups[group].dsts,
-                    workSize);
+              } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+                constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
+                if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
+                  reduceCopyShared<Unroll, RedOp, T,
+                    0, Recv + Src, Recv * MaxRecv + Src,
+                    0, 1, 1, PreOpSrcs>
+                    (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                      Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                      1, ncclShmem.groups[group].dsts,
+                      workSize);
+                } else {
+                  reduceCopyShared<Unroll, RedOp, T,
+                    MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+                    MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+                    (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                      Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
+                      Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+                      workSize);
+                }
               } else {
-                reduceCopyShared<Unroll, RedOp, T,
-                  MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
-                  MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-                  (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
-                    Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                    Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
-                    workSize);
+                workSize = 0;
               }
-            } else {
-              workSize = 0;
             }
             // --- DUPLICATED REDUCE COPY LOGIC END ---
             
@@ -517,66 +540,51 @@ private:
                 printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_COPY,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, opName, dt);
             }
             #endif
-            
-            subBarrier();
-            
-            /* [TMA] Refill after consumption to ensure slot is free */
-            int nextTileIdx = t + NCCL_TMA_PIPE_DEPTH;
-            if (nextTileIdx < sliceTiles) {
-              int nextOffset = nextTileIdx * tmaTileSize;
-              int nextTileSize = (tmaTileSize < currSliceSize - nextOffset) ? tmaTileSize : currSliceSize - nextOffset;
-              int nextSlot = nextTileIdx % NCCL_TMA_PIPE_DEPTH;
 
-              if (tid == 0) {
-                void* globalSrc = (void*)(tmaSliceBaseSrc + nextOffset);
-                void* shmemDst = (char*)ncclTmaShmemPtr() + nextSlot * NCCL_TMA_SLOT_SIZE;
-                size_t copySize = nextTileSize * sizeof(T);
-                
+            if (overlapIssue && isTmaIssuerThread) {
+              void* globalSrc = (void*)(tmaSliceBaseSrc + issueOffset);
+              void* shmemDst = (char*)ncclTmaShmemPtr() + issueSlot * NCCL_TMA_SLOT_SIZE;
+              size_t copySize = issueTileSize * sizeof(T);
               #if ENABLE_PROFILING
               t0 = clock64();
               #endif
-
               #if __CUDA_ARCH__ >= 900
                 if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
-                    cuda::device::memcpy_async_tx(
-                        (char*)shmemDst,
-                        (char*)globalSrc,
-                        cuda::aligned_size_t<16>(copySize),
-                        barriers[nextSlot]
-                    );
-                    tmaTokens[nextSlot] = cuda::device::barrier_arrive_tx(barriers[nextSlot], 1, copySize);
+                  cuda::device::memcpy_async_tx(
+                      (char*)shmemDst,
+                      (char*)globalSrc,
+                      cuda::aligned_size_t<16>(copySize),
+                      barriers[issueSlot]
+                  );
+                  tmaTokens[issueSlot] = cuda::device::barrier_arrive_tx(barriers[issueSlot], 1, copySize);
                 } else {
-                    cuda::memcpy_async(
-                        shmemDst,
-                        globalSrc,
-                        copySize,
-                        barriers[nextSlot]
-                    );
-                    tmaTokens[nextSlot] = barriers[nextSlot].arrive();
+                  cuda::memcpy_async(
+                      shmemDst,
+                      globalSrc,
+                      copySize,
+                      barriers[issueSlot]
+                  );
+                  tmaTokens[issueSlot] = barriers[issueSlot].arrive();
                 }
               #else
               cuda::memcpy_async(
                   shmemDst,
                   globalSrc,
                   copySize,
-                  barriers[nextSlot]
+                  barriers[issueSlot]
               );
-              tmaTokens[nextSlot] = barriers[nextSlot].arrive();
+              tmaTokens[issueSlot] = barriers[issueSlot].arrive();
               #endif
-
               #if ENABLE_PROFILING
-                long long t1_issue_refill = clock64();
-                if (ncclShmem.channelId == 0 && profileChunkId == 0) {
-                    long long dt = t1_issue_refill - t0;
-                    const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
-                    printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, nextTileIdx, opName, dt);
-                }
+              long long t1_issue_overlap = clock64();
+              if (ncclShmem.channelId == 0 && profileChunkId == 0) {
+                long long dt = t1_issue_overlap - t0;
+                const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE,%lld\n", ncclShmem.channelId, profileChunkId, slice, issueTileIdx, opName, dt);
+              }
               #endif
-            } else {
-              tmaTokens[nextSlot] = barriers[nextSlot].arrive();
             }
-            }
-
+            
             tileOffset += currTileSize;
           }
 
