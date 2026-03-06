@@ -53,14 +53,14 @@ struct ProtoTMA {
 
   // Data bytes (no flags etc) in one step of the fifo queue.
   __device__ static int calcBytePerStep() {
-    return ncclShmem.comm.buffSizes[NCCL_PROTO_TMA]/NCCL_STEPS;
+    return (ncclShmem.comm.buffSizes[NCCL_PROTO_TMA]/NCCL_STEPS)*NCCL_LL128_DATAELEMS/NCCL_LL128_LINEELEMS;
   }
   // Granularity of data bytes transferred per thread.
   __device__ static int calcBytePerGrain() {
-    return sizeof(uint64_t); // Bogus value? Nobody queries this metric for simple.
+    return NCCL_LL128_SHMEM_ELEMS_PER_THREAD*NCCL_LL128_DATAELEMS*sizeof(uint64_t)/NCCL_LL128_LINEELEMS;
   }
   // Group width is how many consecutive group values a subchannel occupies.
-  static constexpr int MaxGroupWidth = 2;
+  static constexpr int MaxGroupWidth = 1;
 };
 
 

@@ -28,8 +28,10 @@ namespace {
     // coverity[callee_ptr_arith:FALSE]
     Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
       (tid, nthreads, &ring->prev, &ring->next, work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+    int chunkId = 0;
 
     for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
+      prims.profileChunkId = chunkId;
       ssize_t remCount = channelCount - elemOffset;
       ssize_t chunkOffset;
 
@@ -79,6 +81,7 @@ namespace {
       nelem = (int)min(chunkCount, remCount - chunkOffset);
 
       prims.directRecv(offset, nelem);
+      chunkId++;
     }
   }
 

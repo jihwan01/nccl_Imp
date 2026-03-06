@@ -1682,9 +1682,6 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   // [jihwan] For TMA, we need extra shared memory.
   if (plan->protocol == NCCL_PROTO_TMA) {
     smem += NCCL_TMA_TOTAL_SMEM_SIZE;
-
-    // [DEBUG] Print requested smem size
-    // printf("[DEBUG] Launching Kernel with smem: %d bytes (Dynamic: %d + TMA: %d)\n", smem, ncclShmemDynamicSize(comm->cudaArch), NCCL_TMA_TOTAL_SMEM_SIZE);
   }
 
   cudaStream_t launchStream = planner->streams->stream;
@@ -2019,9 +2016,6 @@ static ncclResult_t topoGetAlgoInfo(
     if (info->algorithm == NCCL_ALGO_RING) nt += WARP_SIZE; // Extra warp for sync
     // More threads or sync warps needed due to split thread model
     if (info->algorithm == NCCL_ALGO_TREE) nt += 4*WARP_SIZE;
-  } else if (info->protocol == NCCL_PROTO_TMA) {
-    if (info->algorithm == NCCL_ALGO_RING) nt += 2*WARP_SIZE; // Extra warps for sync + TMA issue specialization
-    if (info->algorithm == NCCL_ALGO_TREE) nt += 4*WARP_SIZE;
   }
   nt = nt/WARP_SIZE < 3 ? 3*WARP_SIZE : nt;
   if (info->algorithm == NCCL_ALGO_TREE) nt = NCCL_MAX_NTHREADS; // Tree now uses all threads always.
@@ -2144,13 +2138,15 @@ static ncclResult_t calcCollChunking(
   // int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
   // int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
   
-  int chunkSteps = ((info->protocol == NCCL_PROTO_SIMPLE || info->protocol == NCCL_PROTO_TMA) && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
-  int sliceSteps = ((info->protocol == NCCL_PROTO_SIMPLE || info->protocol == NCCL_PROTO_TMA) && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
+  int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
+  int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
   
   
   int chunkSize = stepSize*chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
-  if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
+  if (info->protocol == NCCL_PROTO_LL128 || info->protocol == NCCL_PROTO_TMA) {
+    chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
+  }
 
   if (info->algorithm == NCCL_ALGO_COLLNET_DIRECT) {
     // Optimize chunkSize / nSteps
@@ -2191,7 +2187,8 @@ static ncclResult_t calcCollChunking(
     if ((nBytes < (16 * (concurrentOps * chunkSize))) && (chunkSize > 131072)) chunkSize = 131072;
     if ((nBytes < (4 * (concurrentOps * chunkSize))) && (chunkSize > 65536)) chunkSize = 65536;
     if ((nBytes < (1 * (concurrentOps * chunkSize))) && (chunkSize > 32768)) chunkSize = 32768;
-  } else if (info->algorithm == NCCL_ALGO_TREE && info->protocol == NCCL_PROTO_LL128) {
+  } else if (info->algorithm == NCCL_ALGO_TREE &&
+             (info->protocol == NCCL_PROTO_LL128 || info->protocol == NCCL_PROTO_TMA)) {
     int nNodes = comm->nNodes;
     float ppn = comm->nRanks / (float)nNodes;
     float nstepsLL128 = 1+log2i(nNodes) + 0.1*ppn;

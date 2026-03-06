@@ -8,6 +8,10 @@
 
 #define NCCL_LL128_FLAGTHREAD (NCCL_LL128_LINEELEMS-1)
 
+#ifndef ENABLE_LL128_PRIMS_PROFILING
+#define ENABLE_LL128_PRIMS_PROFILING 1
+#endif
+
 template<typename T, typename RedOp, typename Fan, int Direct, int P2p, bool isNetOffload>
 class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
   public PrimitivesWithoutDirect<Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>> {
@@ -55,15 +59,46 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
 
   int abort = 0;
 
-  inline __device__ void waitSend(int nbytes) {
+  struct LL128DetailProf {
+    unsigned long long loadBeginCycles;
+    unsigned long long loadFinishCycles;
+    unsigned long long dstStoreCycles;
+    unsigned long long sendStoreCycles;
+    unsigned long long waitSendCreditCycles;
+    unsigned long long waitSendFifoCycles;
+    unsigned long long waitSendPolls;
+    unsigned long long barrierCycles;
+    unsigned long long syncWarpCycles;
+    unsigned long long recvWaitCycles;
+    unsigned long long recvDataCycles;
+    unsigned long long recvPollLoads;
+    unsigned long long postCycles;
+  };
+
+  inline __device__ void waitSend(int nbytes, LL128DetailProf* prof = nullptr) {
     if (sendConnHeadPtr) {
       int spins = 0;
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
+        #if ENABLE_LL128_PRIMS_PROFILING
+        unsigned long long tPoll = prof ? clock64() : 0;
+        #endif
         sendConnHeadCache = *sendConnHeadPtr;
+        #if ENABLE_LL128_PRIMS_PROFILING
+        if (prof) {
+          prof->waitSendCreditCycles += clock64() - tPoll;
+          prof->waitSendPolls += 1;
+        }
+        #endif
         if (checkAbort(abort, 1, spins)) break;
       }
       if (sendConnFifo) {
+        #if ENABLE_LL128_PRIMS_PROFILING
+        unsigned long long tFifo = prof ? clock64() : 0;
+        #endif
         sendConnFifo[sendStep[wid]%NCCL_STEPS].size = nbytes;
+        #if ENABLE_LL128_PRIMS_PROFILING
+        if (prof) prof->waitSendFifoCycles += clock64() - tFifo;
+        #endif
       }
       sendConnHead += 1;
     }
@@ -174,11 +209,19 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
   #define WARP_MASK 0xffffffff
 
   template <int ELEMS_PER_THREAD, int RECV, int SEND, int SrcBuf, int DstBuf>
-  __device__ __forceinline__ void recvReduceSendCopy(uint64_t(&v)[ELEMS_PER_THREAD], int ll128Offset, bool postOp) {
+  __device__ __forceinline__ void recvReduceSendCopy(
+      uint64_t(&v)[ELEMS_PER_THREAD], int ll128Offset, bool postOp,
+      LL128DetailProf* detail = nullptr) {
     constexpr int SRC = SrcBuf != -1 ? 1 : 0;
     uint64_t vr[ELEMS_PER_THREAD];
 
+    #if ENABLE_LL128_PRIMS_PROFILING
+      unsigned long long tSync0 = detail ? clock64() : 0;
+    #endif
     __syncwarp();
+    #if ENABLE_LL128_PRIMS_PROFILING
+      if (detail) detail->syncWarpCycles += clock64() - tSync0;
+    #endif
     /************************ Wait first recv ********************/
     if (RECV) {
       uint64_t* ptr = recvPtr(0)+ll128Offset;
@@ -186,22 +229,45 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
       bool needReload;
       int spins = 0;
       do {
+        #if ENABLE_LL128_PRIMS_PROFILING
+          unsigned long long tPoll = detail ? clock64() : 0;
+        #endif
         needReload = false;
         #pragma unroll
         for (int u=0; u<ELEMS_PER_THREAD; u+=2) {
           load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
           needReload |= flagThread && (vr[u+1] != flag);
         }
+        #if ENABLE_LL128_PRIMS_PROFILING
+          if (detail) {
+            unsigned long long dt = clock64() - tPoll;
+            if (needReload) detail->recvWaitCycles += dt;
+            else detail->recvDataCycles += dt;
+            detail->recvPollLoads += 1;
+          }
+        #endif
         needReload &= (0 == checkAbort(abort, 1, spins));
       } while (__any_sync(WARP_MASK, needReload));
 
+      #if ENABLE_LL128_PRIMS_PROFILING
+        unsigned long long tData = detail ? clock64() : 0;
+      #endif
       #pragma unroll
       for (int u=0; u<ELEMS_PER_THREAD; u+=2)
         load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
+      #if ENABLE_LL128_PRIMS_PROFILING
+        if (detail) {
+          detail->recvDataCycles += clock64() - tData;
+          detail->recvPollLoads += 1;
+        }
+      #endif
     }
 
     /************* Finish register load **************/
     if (SRC) {
+      #if ENABLE_LL128_PRIMS_PROFILING
+        unsigned long long tLoad0 = detail ? clock64() : 0;
+      #endif
       // By deferring register shuffle here we've overlapped spinning on first
       // peer's data with memory loads of src data.
       loadRegsFinish(v);
@@ -213,6 +279,9 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
             v[u+1] = applyPreOp(redOp, v[u+1]);
         }
       }
+      #if ENABLE_LL128_PRIMS_PROFILING
+        if (detail) detail->loadFinishCycles += clock64() - tLoad0;
+      #endif
     }
 
     /************************ Recv rest *********************/
@@ -233,15 +302,29 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
         bool needReload;
         int spins = 0;
         do {
+          #if ENABLE_LL128_PRIMS_PROFILING
+            unsigned long long tPoll = detail ? clock64() : 0;
+          #endif
           needReload = false;
           #pragma unroll
           for (int u=0; u<ELEMS_PER_THREAD; u+=2) {
             load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
             needReload |= flagThread && (vr[u+1] != flag);
           }
+          #if ENABLE_LL128_PRIMS_PROFILING
+            if (detail) {
+              unsigned long long dt = clock64() - tPoll;
+              if (needReload) detail->recvWaitCycles += dt;
+              else detail->recvDataCycles += dt;
+              detail->recvPollLoads += 1;
+            }
+          #endif
           needReload &= (0 == checkAbort(abort, 1, spins));
         } while (__any_sync(WARP_MASK, needReload));
 
+        #if ENABLE_LL128_PRIMS_PROFILING
+          unsigned long long tData = detail ? clock64() : 0;
+        #endif
         #pragma unroll
         for (int u=0; u<ELEMS_PER_THREAD; u+=2)
           load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
@@ -251,6 +334,12 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
           v[u]   = applyReduce(redOp, vr[u], v[u]);
           v[u+1] = applyReduce(redOp, vr[u+1], v[u+1]);
         }
+        #if ENABLE_LL128_PRIMS_PROFILING
+          if (detail) {
+            detail->recvDataCycles += clock64() - tData;
+            detail->recvPollLoads += 1;
+          }
+        #endif
       }
     }
     /********************** End Recv ************************/
@@ -265,6 +354,9 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
 
     /************************ Send **************************/
     if (SEND) {
+      #if ENABLE_LL128_PRIMS_PROFILING
+        unsigned long long tSend0 = detail ? clock64() : 0;
+      #endif
       // Yes, for some template arguments this code will be unreachable.  That's fine.
       // coverity[dead_error_line]
       for (int i=1; i<MaxSend && i<fan.nsend(); i++) {
@@ -281,12 +373,28 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
       for (int u=0; u<ELEMS_PER_THREAD; u+=2) {
         store128(ptr+u*WARP_SIZE, v[u], flagThread ? flag : v[u+1]);
       }
+      #if ENABLE_LL128_PRIMS_PROFILING
+        if (detail) detail->sendStoreCycles += clock64() - tSend0;
+      #endif
     }
     /********************** End Send ************************/
   }
 
   static constexpr int WireWordPerSlice = WARP_SIZE*NCCL_LL128_SHMEM_ELEMS_PER_THREAD;
   static constexpr int DataEltPerSlice = (WireWordPerSlice - WireWordPerSlice/NCCL_LL128_LINEELEMS)*(sizeof(uint64_t)/sizeof(T));
+
+  template <int RECV, int SEND, int SrcBuf, int DstBuf>
+  __device__ __forceinline__ static const char* ll128OpName() {
+    if (RECV == 0 && SEND == 1 && SrcBuf == Input && DstBuf == -1) return "SEND";
+    if (RECV == 0 && SEND == 1 && SrcBuf == Output && DstBuf == -1) return "SEND_FROM_OUTPUT";
+    if (RECV == 1 && SEND == 0 && SrcBuf == -1 && DstBuf == Output) return "RECV";
+    if (RECV == 1 && SEND == 1 && SrcBuf == Input && DstBuf == -1) return "RECV_REDUCE_SEND";
+    if (RECV == 1 && SEND == 0 && SrcBuf == Input && DstBuf == Output) return "RECV_REDUCE_COPY";
+    if (RECV == 0 && SEND == 1 && SrcBuf == Input && DstBuf == Output) return "COPY_SEND";
+    if (RECV == 1 && SEND == 1 && SrcBuf == -1 && DstBuf == Output) return "RECV_COPY_SEND";
+    if (RECV == 1 && SEND == 1 && SrcBuf == Input && DstBuf == Output) return "RECV_REDUCE_COPY_SEND";
+    return "UNKNOWN";
+  }
 
   template <int RECV, int SEND, int SrcBuf, int DstBuf>
   __device__ __forceinline__ void GenericOp(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
@@ -297,18 +405,65 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
     int wireOffset = WireWordPerSlice*warp + 2*wid;
     const int nwarps = nthreads/WARP_SIZE;
     nelem = nelem < 0 ? 0 : nelem;
+    LL128DetailProf detail = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    #if ENABLE_LL128_PRIMS_PROFILING
+    unsigned long long profLoadCycles = 0;
+    unsigned long long profSendCycles = 0;
+    unsigned long long profSyncCycles = 0;
+    unsigned long long profElems = 0;
+    #endif
 
-    if (SEND) waitSend(divUp(nelem, DataEltPerSlice)*WireWordPerSlice*sizeof(uint64_t));
+    if (SEND) {
+      #if ENABLE_LL128_PRIMS_PROFILING
+        unsigned long long tSync0 = clock64();
+      #endif
+      waitSend(divUp(nelem, DataEltPerSlice)*WireWordPerSlice*sizeof(uint64_t), &detail);
+      #if ENABLE_LL128_PRIMS_PROFILING
+        profSyncCycles += clock64() - tSync0;
+      #endif
+    }
+    #if ENABLE_LL128_PRIMS_PROFILING
+      unsigned long long tSync0 = clock64();
+    #endif
     barrier();
+    #if ENABLE_LL128_PRIMS_PROFILING
+      unsigned long long dt = clock64() - tSync0;
+      profSyncCycles += dt;
+      detail.barrierCycles += dt;
+    #endif
     nelem -= DataEltPerSlice*warp;
     srcPtr += DataEltPerSlice*warp;
     dstPtr += DataEltPerSlice*warp;
     while (nelem > 0) {
       const int eltInSlice = min(nelem, DataEltPerSlice);
       uint64_t regs[NCCL_LL128_SHMEM_ELEMS_PER_THREAD];
-      if (SRC) loadRegsBegin(regs, srcPtr, eltInSlice);
-      recvReduceSendCopy<NCCL_LL128_SHMEM_ELEMS_PER_THREAD, RECV, SEND, SrcBuf, DstBuf>(regs, wireOffset, postOp);
-      if (DST) storeRegs(dstPtr, regs, eltInSlice);
+      if (SRC) {
+        #if ENABLE_LL128_PRIMS_PROFILING
+          unsigned long long tLoad0 = clock64();
+        #endif
+        loadRegsBegin(regs, srcPtr, eltInSlice);
+        #if ENABLE_LL128_PRIMS_PROFILING
+          unsigned long long dt = clock64() - tLoad0;
+          profLoadCycles += dt;
+          detail.loadBeginCycles += dt;
+        #endif
+      }
+      recvReduceSendCopy<NCCL_LL128_SHMEM_ELEMS_PER_THREAD, RECV, SEND, SrcBuf, DstBuf>(
+          regs, wireOffset, postOp, &detail);
+      if (DST) {
+        #if ENABLE_LL128_PRIMS_PROFILING
+          unsigned long long tLoad0 = clock64();
+        #endif
+        storeRegs(dstPtr, regs, eltInSlice);
+        #if ENABLE_LL128_PRIMS_PROFILING
+          unsigned long long dt = clock64() - tLoad0;
+          profLoadCycles += dt;
+          detail.dstStoreCycles += dt;
+        #endif
+      }
+      #if ENABLE_LL128_PRIMS_PROFILING
+        profElems += (unsigned long long)eltInSlice;
+      #endif
 
       wireOffset += WireWordPerSlice*nwarps;
       srcPtr += DataEltPerSlice*nwarps;
@@ -316,11 +471,76 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
       nelem -= DataEltPerSlice*nwarps;
     }
 
+    #if ENABLE_LL128_PRIMS_PROFILING
+      tSync0 = clock64();
+    #endif
     barrier();
-    if (SEND) for (int i=0; i < MaxSend; i++) sendStep[i] += 1;
-    if (SEND) postSend();
-    if (RECV) for (int i=0; i < MaxRecv; i++) recvStep[i] += 1;
-    if (RECV) postRecv();
+    #if ENABLE_LL128_PRIMS_PROFILING
+      unsigned long long dt = clock64() - tSync0;
+      profSyncCycles += dt;
+      detail.barrierCycles += dt;
+    #endif
+    if (SEND) {
+      #if ENABLE_LL128_PRIMS_PROFILING
+        tSync0 = clock64();
+      #endif
+      for (int i=0; i < MaxSend; i++) sendStep[i] += 1;
+      postSend();
+      #if ENABLE_LL128_PRIMS_PROFILING
+        unsigned long long dt = clock64() - tSync0;
+        profSyncCycles += dt;
+        detail.postCycles += dt;
+      #endif
+    }
+    if (RECV) {
+      #if ENABLE_LL128_PRIMS_PROFILING
+        tSync0 = clock64();
+      #endif
+      for (int i=0; i < MaxRecv; i++) recvStep[i] += 1;
+      postRecv();
+      #if ENABLE_LL128_PRIMS_PROFILING
+        unsigned long long dt = clock64() - tSync0;
+        profSyncCycles += dt;
+        detail.postCycles += dt;
+      #endif
+    }
+    #if ENABLE_LL128_PRIMS_PROFILING
+      if (tid == 0) {
+        profLoadCycles = detail.loadBeginCycles + detail.loadFinishCycles + detail.dstStoreCycles;
+        profSendCycles = detail.sendStoreCycles;
+        profSyncCycles =
+          detail.waitSendCreditCycles + detail.waitSendFifoCycles + detail.barrierCycles + detail.syncWarpCycles +
+          detail.recvWaitCycles + detail.recvDataCycles + detail.postCycles;
+        unsigned long long total = profLoadCycles + profSendCycles + profSyncCycles;
+        printf("NCCL_PROFILE_LL128,%d,%d,%s,%llu,%llu,%llu,%llu,%llu\n",
+          ncclShmem.channelId,
+          profileChunkId,
+          ll128OpName<RECV, SEND, SrcBuf, DstBuf>(),
+          profLoadCycles,
+          profSendCycles,
+          profSyncCycles,
+          total,
+          profElems);
+        printf("NCCL_PROFILE_LL128_DETAIL,%d,%d,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+          ncclShmem.channelId,
+          profileChunkId,
+          ll128OpName<RECV, SEND, SrcBuf, DstBuf>(),
+          detail.loadBeginCycles,
+          detail.loadFinishCycles,
+          detail.dstStoreCycles,
+          detail.sendStoreCycles,
+          detail.waitSendCreditCycles,
+          detail.waitSendFifoCycles,
+          detail.waitSendPolls,
+          detail.barrierCycles,
+          detail.syncWarpCycles,
+          detail.recvWaitCycles,
+          detail.recvDataCycles,
+          detail.recvPollLoads,
+          detail.postCycles,
+          profElems);
+      }
+    #endif
   }
 
   __device__ __forceinline__ void loadRecvConn(struct ncclConnInfo* conn, int i) {

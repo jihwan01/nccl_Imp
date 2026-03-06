@@ -59,7 +59,9 @@ ncclResult_t ncclScheduleBcastTasksToPlan(
     int stepSize = comm->buffSizes[proto]/NCCL_STEPS;
     int chunkSize = chunkSteps*stepSize;
     if (proto == NCCL_PROTO_LL) chunkSize = chunkSize/2;
-    if (proto == NCCL_PROTO_LL128) chunkSize = (chunkSize/NCCL_LL128_LINEELEMS)*NCCL_LL128_DATAELEMS;
+    if (proto == NCCL_PROTO_LL128 || proto == NCCL_PROTO_TMA) {
+      chunkSize = (chunkSize/NCCL_LL128_LINEELEMS)*NCCL_LL128_DATAELEMS;
+    }
     size_t grainSize = ncclProtoGrainSize(proto);
     nChannels = tcoll.nMaxChannels;
     chunkSize = chunkSize / grainSize * grainSize;

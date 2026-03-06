@@ -4,6 +4,10 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#ifndef ENABLE_LL_PRIMS_PROFILING
+#define ENABLE_LL_PRIMS_PROFILING 1
+#endif
+
 template<typename T, typename RedOp, typename Fan, int Direct, int P2p, bool isNetOffload>
 class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
   public PrimitivesWithoutDirect<Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>> {
@@ -53,20 +57,58 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
 
   int abort = 0;
 
-  inline __device__ void waitSend(int nbytes) {
+  struct LLDetailProf {
+    unsigned long long loadBeginCycles;
+    unsigned long long loadFinishCycles;
+    unsigned long long dstStoreCycles;
+    unsigned long long sendStoreCycles;
+    unsigned long long waitSendCreditCycles;
+    unsigned long long waitSendFifoCycles;
+    unsigned long long waitSendBarrierCycles;
+    unsigned long long waitSendPolls;
+    unsigned long long recvBeginCycles;
+    unsigned long long recvBeginLoads;
+    unsigned long long recvWaitCycles;
+    unsigned long long recvDataCycles;
+    unsigned long long recvPollLoads;
+    unsigned long long postCycles;
+  };
+
+  inline __device__ void waitSend(int nbytes, LLDetailProf* prof = nullptr) {
     if (sendConnHeadPtr) {
       int spins = 0;
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
+        #if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long tPoll = prof ? clock64() : 0;
+        #endif
         sendConnHeadCache = *sendConnHeadPtr;
+        #if ENABLE_LL_PRIMS_PROFILING
+        if (prof) {
+          prof->waitSendCreditCycles += clock64() - tPoll;
+          prof->waitSendPolls += 1;
+        }
+        #endif
         if (checkAbort(abort, 1, spins)) break;
       }
       if (sendConnFifo) {
         int size = ((sendConnHead & NCCL_LL_CLEAN_MASK) == NCCL_LL_CLEAN_MASK) ? stepLines*sizeof(union ncclLLFifoLine) : nbytes;
+        #if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long tFifo = prof ? clock64() : 0;
+        #endif
         sendConnFifo[sendConnHead%NCCL_STEPS].size = size;
+        #if ENABLE_LL_PRIMS_PROFILING
+        if (prof) prof->waitSendFifoCycles += clock64() - tFifo;
+        #endif
       }
       sendConnHead += 1;
     }
+    #if ENABLE_LL_PRIMS_PROFILING
+    unsigned long long tBarrier = prof ? clock64() : 0;
+    #endif
     barrier();
+    #if ENABLE_LL_PRIMS_PROFILING
+    if (prof) prof->waitSendBarrierCycles += clock64() - tBarrier;
+    #endif
   }
 
   inline __device__ void incRecv(int i) {
@@ -86,37 +128,70 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
     sendStep[i]++;
   }
 
-  __device__ uint64_t readLL(int offset, int i) {
+  __device__ uint64_t readLL(int offset, int i, LLDetailProf* prof = nullptr) {
     union ncclLLFifoLine* src = recvPtr(i) + offset;
     uint32_t flag = recvFlag(i);
     uint32_t data1, flag1, data2, flag2;
     int spins = 0;
-    do {
+    while (true) {
+      #if ENABLE_LL_PRIMS_PROFILING
+      unsigned long long tLoad = prof ? clock64() : 0;
+      #endif
       asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(data1), "=r"(flag1), "=r"(data2), "=r"(flag2) : "l"(&src->i4) : "memory");
-      if (checkAbort(abort, 1, spins)) break;
-    } while ((flag1 != flag) || (flag2 != flag));
+      bool ready = (flag1 == flag) && (flag2 == flag);
+      #if ENABLE_LL_PRIMS_PROFILING
+      if (prof) {
+        unsigned long long dt = clock64() - tLoad;
+        if (ready) prof->recvDataCycles += dt;
+        else prof->recvWaitCycles += dt;
+        prof->recvPollLoads += 1;
+      }
+      #endif
+      if (ready || checkAbort(abort, 1, spins)) break;
+    }
     uint64_t val64 = data1 + (((uint64_t)data2) << 32);
     return val64;
   }
 
   template<int BeginIx>
-  __device__ void readLLBeginAll(int offset, ncclLLFifoLine(&line)[MaxRecv]) {
+  __device__ void readLLBeginAll(int offset, ncclLLFifoLine(&line)[MaxRecv], LLDetailProf* prof = nullptr) {
     #pragma unroll
     for (int i=BeginIx; i < MaxRecv; i++) {
       // Yes, for some template arguments this code will be unreachable.  That's fine.
       // coverity[dead_error_line]
       if (i < fan.nrecv()) {
         union ncclLLFifoLine* src = recvPtr(i) + offset;
+        #if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long tLoad = prof ? clock64() : 0;
+        #endif
         asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(line[i].data1), "=r"(line[i].flag1), "=r"(line[i].data2), "=r"(line[i].flag2) : "l"(&src->i4) : "memory");
+        #if ENABLE_LL_PRIMS_PROFILING
+        if (prof) {
+          prof->recvBeginCycles += clock64() - tLoad;
+          prof->recvBeginLoads += 1;
+        }
+        #endif
       }
     }
   }
-  __device__ uint64_t readLLFinish(int offset, ncclLLFifoLine(&line)[MaxRecv], int i) {
+  __device__ uint64_t readLLFinish(int offset, ncclLLFifoLine(&line)[MaxRecv], int i, LLDetailProf* prof = nullptr) {
     union ncclLLFifoLine* src = recvPtr(i) + offset;
     uint32_t flag = recvFlag(i);
     int spins = 0;
     while (line[i].flag1 != flag || line[i].flag2 != flag) {
+      #if ENABLE_LL_PRIMS_PROFILING
+      unsigned long long tLoad = prof ? clock64() : 0;
+      #endif
       asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(line[i].data1), "=r"(line[i].flag1), "=r"(line[i].data2), "=r"(line[i].flag2) : "l"(&src->i4) : "memory");
+      bool ready = (line[i].flag1 == flag) && (line[i].flag2 == flag);
+      #if ENABLE_LL_PRIMS_PROFILING
+      if (prof) {
+        unsigned long long dt = clock64() - tLoad;
+        if (ready) prof->recvDataCycles += dt;
+        else prof->recvWaitCycles += dt;
+        prof->recvPollLoads += 1;
+      }
+      #endif
       if (checkAbort(abort, 1, spins)) break;
     }
     uint64_t val64 = line[i].data1 + (((uint64_t)line[i].data2) << 32);
@@ -178,7 +253,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
     __device__ void loadBegin(T *src, int eltN) {
       if (sizeof(T) <= 2) {
         misalign = reinterpret_cast<uintptr_t>(src)%4;
-        uint32_t *p = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(src) & -uintptr_t(4));
+        uint32_t *p = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(src) & -uintptr_t(4)); // align down to 4 bytes
         u4[0] = load(p+0);
         u4[1] = misalign + eltN*sizeof(T) > 4 ? load(p+1) : 0;
         // u4[2] would be simpler, but that throws warnings on some compilers
@@ -222,17 +297,47 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
   }
 
   template <int RECV, int SEND, int SrcBuf, int DstBuf>
+  __device__ __forceinline__ static const char* llOpName() {
+    if (RECV == 0 && SEND == 1 && SrcBuf == Input && DstBuf == -1) return "SEND";
+    if (RECV == 0 && SEND == 1 && SrcBuf == Output && DstBuf == -1) return "SEND_FROM_OUTPUT";
+    if (RECV == 1 && SEND == 0 && SrcBuf == -1 && DstBuf == Output) return "RECV";
+    if (RECV == 1 && SEND == 1 && SrcBuf == Input && DstBuf == -1) return "RECV_REDUCE_SEND";
+    if (RECV == 1 && SEND == 0 && SrcBuf == Input && DstBuf == Output) return "RECV_REDUCE_COPY";
+    if (RECV == 0 && SEND == 1 && SrcBuf == Input && DstBuf == Output) return "COPY_SEND";
+    if (RECV == 1 && SEND == 1 && SrcBuf == -1 && DstBuf == Output) return "RECV_COPY_SEND";
+    if (RECV == 1 && SEND == 1 && SrcBuf == Input && DstBuf == Output) return "RECV_REDUCE_COPY_SEND";
+    return "UNKNOWN";
+  }
+
+  template <int RECV, int SEND, int SrcBuf, int DstBuf>
   __device__ __forceinline__ void LLGenericOp(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
     constexpr int SRC = SrcBuf != -1 ? 1 : 0;
     constexpr int DST = DstBuf != -1 ? 1 : 0;
     T *srcElts = SrcBuf == -1 ? nullptr : userBufs[SrcBuf] + srcIx;
     T *dstElts = DstBuf == -1 ? nullptr : userBufs[DstBuf] + dstIx;
+    
+  
+    #if ENABLE_LL_PRIMS_PROFILING
+    unsigned long long profLoadCycles = 0;
+    unsigned long long profSendCycles = 0;
+    unsigned long long profSyncCycles = 0;
+    unsigned long long profElems = 0;
+    #endif
+    LLDetailProf detail = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
     // Always waitSend in case of cleanup
     nelem = nelem < 0 ? 0 : nelem;
-    if (SEND) waitSend(divUp(nelem, EltPerLine)*sizeof(ncclLLFifoLine));
+    if (SEND) {
+      #if ENABLE_LL_PRIMS_PROFILING
+      unsigned long long t0 = clock64();
+      #endif
+      waitSend(divUp(nelem, EltPerLine)*sizeof(ncclLLFifoLine), &detail); // contains barrier
+      #if ENABLE_LL_PRIMS_PROFILING
+      profSyncCycles += clock64() - t0;
+      #endif
+    }
 
-    nelem -= tid*EltPerLine;
+    nelem -= tid*EltPerLine; // TODD: why is this necessary? Why the amount is calculated based on tid?
     srcElts += tid*EltPerLine;
     dstElts += tid*EltPerLine;
     int offset = tid;
@@ -244,15 +349,34 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
       ncclLLFifoLine line[MaxRecv];
       uint64_t data, peerData;
       if (SRC) {
-        dl.loadBegin(srcElts, eltInLine);
+        
+        #if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long t0 = clock64();
+        #endif
+        
+        dl.loadBegin(srcElts, eltInLine); // 
+        
+        #if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long dt = clock64() - t0;
+        profLoadCycles += dt;
+        detail.loadBeginCycles += dt;
+        #endif
         srcElts += eltPerTrip;
       }
       if (RECV) {
-        readLLBeginAll<1>(offset, line);
-        peerData = readLL(offset, 0);
+        readLLBeginAll<1>(offset, line, &detail);
+        peerData = readLL(offset, 0, &detail);
       }
       if (SRC) {
+#if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long t0 = clock64();
+#endif
         data = dl.loadFinish();
+#if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long dt = clock64() - t0;
+        profLoadCycles += dt;
+        detail.loadFinishCycles += dt;
+#endif
         if (SrcBuf == Input) data = applyPreOp(redOp, data);
       }
       if (RECV) {
@@ -261,7 +385,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
         // Yes, for some template arguments this code will be unreachable.  That's fine.
         // coverity[dead_error_line]
         for (int i=1; i < MaxRecv && i < fan.nrecv(); i++) {
-          peerData = readLLFinish(offset, line, i);
+          peerData = readLLFinish(offset, line, i, &detail);
           data = applyReduce(redOp, peerData, data);
         }
       }
@@ -270,31 +394,107 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
 
       // Send : inter-node, then intra-node, then local
       if (SEND) {
+#if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long t0 = clock64();
+#endif
         // Yes, for some template arguments this code will be unreachable.  That's fine.
         // coverity[dead_error_line]
         for (int i=1; i < MaxSend && i < fan.nsend(); i++)
           storeLL(sendPtr(i)+offset, data, sendFlag(i));
         storeLL(sendPtr(0)+offset, data, sendFlag(0));
+#if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long dt = clock64() - t0;
+        profSendCycles += dt;
+        detail.sendStoreCycles += dt;
+#endif
       }
       if (DST) {
+#if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long t0 = clock64();
+#endif
         storeData(dstElts, data, eltInLine);
+#if ENABLE_LL_PRIMS_PROFILING
+        unsigned long long dt = clock64() - t0;
+        profLoadCycles += dt;
+        detail.dstStoreCycles += dt;
+        profElems += (unsigned long long)eltInLine;
+#endif
         dstElts += eltPerTrip;
+      } else {
+#if ENABLE_LL_PRIMS_PROFILING
+        profElems += (unsigned long long)eltInLine;
+#endif
       }
       nelem -= eltPerTrip;
       offset += nthreads;
     }
 
     if (RECV) {
+#if ENABLE_LL_PRIMS_PROFILING
+      unsigned long long t0 = clock64();
+#endif
       for (int i=0; i < MaxRecv; i++) incRecv(i);
       postRecv();
+#if ENABLE_LL_PRIMS_PROFILING
+      unsigned long long dt = clock64() - t0;
+      profSyncCycles += dt;
+      detail.postCycles += dt;
+#endif
     }
     if (SEND) {
+#if ENABLE_LL_PRIMS_PROFILING
+      unsigned long long t0 = clock64();
+#endif
       // Yes, for some template arguments this code will be unreachable.  That's fine.
       // coverity[dead_error_line]
       for (int i=1; i < MaxSend && i < fan.nsend(); i++)
         incSend(i, offset);
       incSend(0, offset);
+#if ENABLE_LL_PRIMS_PROFILING
+      unsigned long long dt = clock64() - t0;
+      profSyncCycles += dt;
+      detail.postCycles += dt;
+#endif
     }
+
+#if ENABLE_LL_PRIMS_PROFILING
+    if (tid == 0) {
+      profLoadCycles = detail.loadBeginCycles + detail.loadFinishCycles + detail.dstStoreCycles;
+      profSendCycles = detail.sendStoreCycles;
+      profSyncCycles =
+        detail.waitSendCreditCycles + detail.waitSendFifoCycles + detail.waitSendBarrierCycles +
+        detail.recvBeginCycles + detail.recvWaitCycles + detail.recvDataCycles + detail.postCycles;
+      unsigned long long total = profLoadCycles + profSendCycles + profSyncCycles;
+      printf("NCCL_PROFILE_LL,%d,%d,%s,%llu,%llu,%llu,%llu,%llu\n",
+        ncclShmem.channelId,
+        profileChunkId,
+        llOpName<RECV, SEND, SrcBuf, DstBuf>(),
+        profLoadCycles,
+        profSendCycles,
+        profSyncCycles,
+        total,
+        profElems);
+      printf("NCCL_PROFILE_LL_DETAIL,%d,%d,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+        ncclShmem.channelId,
+        profileChunkId,
+        llOpName<RECV, SEND, SrcBuf, DstBuf>(),
+        detail.loadBeginCycles,
+        detail.loadFinishCycles,
+        detail.dstStoreCycles,
+        detail.sendStoreCycles,
+        detail.waitSendCreditCycles,
+        detail.waitSendFifoCycles,
+        detail.waitSendBarrierCycles,
+        detail.waitSendPolls,
+        detail.recvBeginCycles,
+        detail.recvBeginLoads,
+        detail.recvWaitCycles,
+        detail.recvDataCycles,
+        detail.recvPollLoads,
+        detail.postCycles,
+        profElems);
+    }
+#endif
   }
 
   __device__ __forceinline__ void loadRecvConn(struct ncclConnInfo* conn, int i) {
