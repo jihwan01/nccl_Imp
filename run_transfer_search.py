@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import csv
-import ctypes
 import dataclasses
 import datetime as dt
 import itertools
-import math
 import os
 import pathlib
 import re
@@ -15,6 +13,8 @@ import subprocess
 import sys
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
+
+FIXED_MAX_DYN_SMEM_BYTES = 228 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -213,75 +213,9 @@ def generate_configs(args: argparse.Namespace) -> Tuple[List[BenchConfig], List[
     return valid, skipped
 
 
-def query_max_dynamic_smem_bytes(device: int) -> Optional[int]:
-    # Runtime API enum: cudaDevAttrMaxSharedMemoryPerBlockOptin
-    cuda_dev_attr_max_shared_optin = 97
-    # Fallback attr: cudaDevAttrMaxSharedMemoryPerBlock
-    cuda_dev_attr_max_shared = 8
-
-    lib_names = [
-        "libcudart.so",
-        "libcudart.so.12",
-        "libcudart.so.11.0",
-        "libcudart.dylib",
-        "cudart64_120.dll",
-        "cudart64_110.dll",
-    ]
-
-    cudart = None
-    for name in lib_names:
-        try:
-            cudart = ctypes.CDLL(name)
-            break
-        except OSError:
-            continue
-    if cudart is None:
-        return None
-
-    cuda_set_device = cudart.cudaSetDevice
-    cuda_set_device.argtypes = [ctypes.c_int]
-    cuda_set_device.restype = ctypes.c_int
-
-    cuda_get_attr = cudart.cudaDeviceGetAttribute
-    cuda_get_attr.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
-    cuda_get_attr.restype = ctypes.c_int
-
-    # Ignore failure here and let attribute query decide availability.
-    cuda_set_device(int(device))
-
-    val_optin = ctypes.c_int()
-    rc_optin = cuda_get_attr(ctypes.byref(val_optin), cuda_dev_attr_max_shared_optin, int(device))
-
-    val_basic = ctypes.c_int()
-    rc_basic = cuda_get_attr(ctypes.byref(val_basic), cuda_dev_attr_max_shared, int(device))
-
-    candidates = []
-    if rc_optin == 0 and val_optin.value > 0:
-        candidates.append(val_optin.value)
-    if rc_basic == 0 and val_basic.value > 0:
-        candidates.append(val_basic.value)
-
-    if not candidates:
-        return None
-    return max(candidates)
-
-
-def maybe_compile(args: argparse.Namespace) -> None:
+def compile_binary(args: argparse.Namespace) -> None:
     binary_path = pathlib.Path(args.binary).resolve()
     source_path = pathlib.Path(args.source).resolve()
-
-    mode = args.compile_mode
-    if mode == "always":
-        need_compile = True
-    elif mode == "if_missing":
-        need_compile = not binary_path.exists()
-    elif mode == "never":
-        need_compile = False
-    else:
-        raise ValueError(f"Unknown compile mode: {mode}")
-
-    if not need_compile:
-        return
 
     if not source_path.exists():
         raise FileNotFoundError(f"Source file not found: {source_path}")
@@ -300,59 +234,31 @@ def maybe_compile(args: argparse.Namespace) -> None:
         raise RuntimeError(f"Compile failed with exit code {proc.returncode}")
 
 
-TMA_RE = re.compile(r"\[TMA\]\s+avg=([0-9.]+)\s+(ms|us)\s+BW=([0-9.]+)\s+GB/s\s+wrong=(\d+)")
-SIMPLE_RE = re.compile(r"\[SIMPLE\]\s+avg=([0-9.]+)\s+(ms|us)\s+BW=([0-9.]+)\s+GB/s\s+wrong=(\d+)")
-TMA_DETAIL_RE = re.compile(
-    r"detail\(wait/issue/store\)\s+ns\s+=\s+([0-9.]+)\s+/\s+([0-9.]+)\s+/\s+([0-9.]+)\s+samples\s+=\s+(\d+)\s+/\s+(\d+)\s+/\s+(\d+)\s+blocks=(\d+)"
-)
-SIMPLE_DETAIL_RE = re.compile(
-    r"detail\(io\)\s+ns\s+=\s+([0-9.]+)\s+samples\s+=\s+(\d+)\s+blocks=(\d+)"
-)
+TMA_RE = re.compile(r"\[TMA\]\s+avg=([0-9.]+)\s+us\s+BW=([0-9.]+)\s+GB/s\s+wrong=(\d+)")
+SIMPLE_RE = re.compile(r"\[SIMPLE\]\s+avg=([0-9.]+)\s+us\s+BW=([0-9.]+)\s+GB/s\s+wrong=(\d+)")
 
 
 def parse_output(text: str) -> Dict[str, Optional[float]]:
     out: Dict[str, Optional[float]] = {
         "tma_us": None,
-        "tma_ms": None,
         "tma_bw_gbps": None,
         "tma_wrong": None,
         "simple_us": None,
-        "simple_ms": None,
         "simple_bw_gbps": None,
         "simple_wrong": None,
-        "tma_wait_ns": None,
-        "tma_issue_ns": None,
-        "tma_store_ns": None,
-        "simple_io_ns": None,
     }
 
     m = TMA_RE.search(text)
     if m:
-        t = float(m.group(1))
-        unit = m.group(2)
-        out["tma_us"] = t if unit == "us" else t * 1000.0
-        out["tma_ms"] = t if unit == "ms" else t / 1000.0
-        out["tma_bw_gbps"] = float(m.group(3))
-        out["tma_wrong"] = float(m.group(4))
+        out["tma_us"] = float(m.group(1))
+        out["tma_bw_gbps"] = float(m.group(2))
+        out["tma_wrong"] = float(m.group(3))
 
     m = SIMPLE_RE.search(text)
     if m:
-        t = float(m.group(1))
-        unit = m.group(2)
-        out["simple_us"] = t if unit == "us" else t * 1000.0
-        out["simple_ms"] = t if unit == "ms" else t / 1000.0
-        out["simple_bw_gbps"] = float(m.group(3))
-        out["simple_wrong"] = float(m.group(4))
-
-    m = TMA_DETAIL_RE.search(text)
-    if m:
-        out["tma_wait_ns"] = float(m.group(1))
-        out["tma_issue_ns"] = float(m.group(2))
-        out["tma_store_ns"] = float(m.group(3))
-
-    m = SIMPLE_DETAIL_RE.search(text)
-    if m:
-        out["simple_io_ns"] = float(m.group(1))
+        out["simple_us"] = float(m.group(1))
+        out["simple_bw_gbps"] = float(m.group(2))
+        out["simple_wrong"] = float(m.group(3))
 
     return out
 
@@ -379,24 +285,6 @@ def write_csv(path: pathlib.Path, rows: List[Dict[str, object]], fieldnames: Lis
             w.writerow(row)
 
 
-def markdown_table(rows: List[Dict[str, object]], columns: List[str]) -> str:
-    if not rows:
-        return "_(none)_"
-    lines = []
-    lines.append("| " + " | ".join(columns) + " |")
-    lines.append("|" + "|".join(["---"] * len(columns)) + "|")
-    for row in rows:
-        vals = []
-        for c in columns:
-            v = row.get(c, "")
-            if isinstance(v, float):
-                vals.append(f"{v:.4f}")
-            else:
-                vals.append(str(v))
-        lines.append("| " + " | ".join(vals) + " |")
-    return "\n".join(lines)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run search space for simple_tma_transfer_bench and summarize results."
@@ -404,7 +292,6 @@ def main() -> int:
 
     parser.add_argument("--binary", default="./simple_tma_transfer_bench")
     parser.add_argument("--source", default="./simple_tma_transfer_bench.cu")
-    parser.add_argument("--compile-mode", choices=["never", "if_missing", "always"], default="if_missing")
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--arch", default="sm_90a")
     parser.add_argument("--extra-nvcc-flags", default="")
@@ -444,20 +331,18 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--src", type=int, default=0)
     parser.add_argument("--dst", type=int, default=1)
-    parser.add_argument("--detail", type=int, default=1)
     parser.add_argument("--verify", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--timeout-sec", type=int, default=1800)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--tag", default="")
-    parser.add_argument(
-        "--max-dyn-smem-kb",
-        type=int,
-        default=0,
-        help="Override src GPU max dynamic shared memory (KB). 0 means auto-detect.",
-    )
 
     parser.add_argument("--out-dir", default="")
+    parser.add_argument(
+        "--summary-csv-name",
+        default="summary.csv",
+        help="Output filename for summary CSV inside --out-dir (default: summary.csv)",
+    )
     parser.add_argument("--env", action="append", default=[], help="Extra env in KEY=VALUE form")
 
     args = parser.parse_args()
@@ -498,30 +383,26 @@ def main() -> int:
 
     configs, skipped = generate_configs(args)
 
-    if args.max_dyn_smem_kb > 0:
-        max_dyn_smem_bytes = args.max_dyn_smem_kb * 1024
-    else:
-        max_dyn_smem_bytes = query_max_dynamic_smem_bytes(args.src)
-    if max_dyn_smem_bytes is not None:
-        kept: List[BenchConfig] = []
-        for cfg in configs:
-            if cfg.smem_bytes > max_dyn_smem_bytes:
-                skipped.append(
-                    {
-                        "total_mb": str(cfg.total_mb),
-                        "grid": str(cfg.grid),
-                        "block": str(cfg.block),
-                        "smem_kb": str(cfg.smem_kb),
-                        "pipe": str(cfg.pipe),
-                        "simple_slice_kb": str(cfg.simple_slice_kb),
-                        "tma_slice_kb": str(cfg.tma_slice_kb),
-                        "tma_tile_kb": str(cfg.tma_tile_kb),
-                        "reason": f"smem_bytes > device_max_dynamic_smem ({cfg.smem_bytes} > {max_dyn_smem_bytes})",
-                    }
-                )
-            else:
-                kept.append(cfg)
-        configs = kept
+    max_dyn_smem_bytes = FIXED_MAX_DYN_SMEM_BYTES
+    kept: List[BenchConfig] = []
+    for cfg in configs:
+        if cfg.smem_bytes > max_dyn_smem_bytes:
+            skipped.append(
+                {
+                    "total_mb": str(cfg.total_mb),
+                    "grid": str(cfg.grid),
+                    "block": str(cfg.block),
+                    "smem_kb": str(cfg.smem_kb),
+                    "pipe": str(cfg.pipe),
+                    "simple_slice_kb": str(cfg.simple_slice_kb),
+                    "tma_slice_kb": str(cfg.tma_slice_kb),
+                    "tma_tile_kb": str(cfg.tma_tile_kb),
+                    "reason": f"smem_bytes > fixed_max_dynamic_smem ({cfg.smem_bytes} > {max_dyn_smem_bytes})",
+                }
+            )
+        else:
+            kept.append(cfg)
+    configs = kept
 
     planned_path = out_dir / "planned_configs.csv"
     write_csv(
@@ -548,16 +429,7 @@ def main() -> int:
     print(f"[plan] pair_slices={args.pair_slices}")
     print("[plan] TMA constraint: slot_bytes == tile_bytes (smem_bytes/pipe == tma_tile_bytes)")
     print(f"[plan] derive_smem={args.derive_smem}")
-    if max_dyn_smem_bytes is not None:
-        if args.max_dyn_smem_kb > 0:
-            print(
-                f"[plan] src device max dynamic smem: {max_dyn_smem_bytes} B "
-                f"({max_dyn_smem_bytes // 1024} KB, user override)"
-            )
-        else:
-            print(f"[plan] src device max dynamic smem: {max_dyn_smem_bytes} B ({max_dyn_smem_bytes // 1024} KB)")
-    else:
-        print("[plan] src device max dynamic smem: unknown (could not query with cudart)")
+    print(f"[plan] max dynamic smem (fixed): {max_dyn_smem_bytes} B ({max_dyn_smem_bytes // 1024} KB)")
     print(f"[plan] output dir: {out_dir}")
 
     if args.dry_run:
@@ -565,7 +437,7 @@ def main() -> int:
         return 0
 
     try:
-        maybe_compile(args)
+        compile_binary(args)
     except Exception as e:
         print(f"[error] compile step failed: {e}", file=sys.stderr)
         return 2
@@ -598,7 +470,6 @@ def main() -> int:
                 "--simple_slice_kb", str(cfg.simple_slice_kb),
                 "--tma_slice_kb", str(cfg.tma_slice_kb),
                 "--tma_tile_kb", str(cfg.tma_tile_kb),
-                "--detail", str(args.detail),
                 "--verify", str(args.verify),
             ]
             cmd_str = fmt_cmd(cmd)
@@ -686,19 +557,13 @@ def main() -> int:
                 "tma_tile_kb": cfg.tma_tile_kb,
 
                 "tma_us": parsed["tma_us"],
-                "tma_ms": parsed["tma_ms"],
                 "tma_bw_gbps": parsed["tma_bw_gbps"],
                 "tma_wrong": parsed["tma_wrong"],
                 "simple_us": parsed["simple_us"],
-                "simple_ms": parsed["simple_ms"],
                 "simple_bw_gbps": parsed["simple_bw_gbps"],
                 "simple_wrong": parsed["simple_wrong"],
                 "speedup_bw_tma_over_simple": speedup_bw,
                 "speedup_us_simple_over_tma": speedup_us,
-                "tma_wait_ns": parsed["tma_wait_ns"],
-                "tma_issue_ns": parsed["tma_issue_ns"],
-                "tma_store_ns": parsed["tma_store_ns"],
-                "simple_io_ns": parsed["simple_io_ns"],
             }
             all_rows.append(row)
 
@@ -710,10 +575,9 @@ def main() -> int:
             "run_index", "status", "returncode", "error", "elapsed_s",
             "repeat", "total_mb", "grid", "block", "smem_kb", "pipe", "simple_slice_kb", "tma_slice_kb", "tma_tile_kb",
             "tma_issue_warp",
-            "tma_us", "tma_ms", "tma_bw_gbps", "tma_wrong",
-            "simple_us", "simple_ms", "simple_bw_gbps", "simple_wrong",
+            "tma_us", "tma_bw_gbps", "tma_wrong",
+            "simple_us", "simple_bw_gbps", "simple_wrong",
             "speedup_bw_tma_over_simple", "speedup_us_simple_over_tma",
-            "tma_wait_ns", "tma_issue_ns", "tma_store_ns", "simple_io_ns",
             "cmd", "log_path",
         ],
     )
@@ -795,7 +659,7 @@ def main() -> int:
         )
     )
 
-    summary_path = out_dir / "summary.csv"
+    summary_path = out_dir / args.summary_csv_name
     write_csv(
         summary_path,
         summary_rows,
@@ -813,86 +677,12 @@ def main() -> int:
     ok_total = sum(1 for r in all_rows if r["status"] == "ok")
     fail_total = len(all_rows) - ok_total
 
-    clean_summary = [
-        r for r in summary_rows
-        if (r["tma_wrong_max"] in (None, 0.0))
-        and (r["simple_wrong_max"] in (None, 0.0))
-    ]
-
-    top_bw = sorted(
-        clean_summary,
-        key=lambda r: -float(r["tma_bw_gbps_mean"]) if r["tma_bw_gbps_mean"] is not None else math.inf,
-    )[:10]
-
-    top_speedup = sorted(
-        clean_summary,
-        key=lambda r: -float(r["speedup_bw_tma_over_simple"]) if r["speedup_bw_tma_over_simple"] is not None else math.inf,
-    )[:10]
-
-    md_path = out_dir / "summary.md"
-    with md_path.open("w") as f:
-        f.write("# Transfer Search Summary\n\n")
-        f.write(f"- Timestamp: {dt.datetime.now().isoformat()}\n")
-        f.write(f"- Output dir: `{out_dir}`\n")
-        f.write(f"- Total configs: {len(configs)}\n")
-        f.write(f"- Repeats: {args.repeats}\n")
-        f.write(f"- Pair slices: {args.pair_slices}\n")
-        f.write(f"- Total runs: {len(all_rows)}\n")
-        f.write(f"- Runs ok: {ok_total}\n")
-        f.write(f"- Runs not ok: {fail_total}\n")
-        f.write("- Time unit in summary tables: us\n")
-        f.write(f"- Total wall time: {done_s:.1f} s\n")
-        f.write("\n")
-
-        f.write("## Search Space\n\n")
-        f.write(f"- total_mb: {args.total_mb_list}\n")
-        f.write(f"- grid: {args.grid_list}\n")
-        f.write(f"- block: {args.block_list}\n")
-        if args.derive_smem:
-            f.write("- smem_kb: derived as tma_tile_kb * pipe\n")
-        else:
-            f.write(f"- smem_kb: {args.smem_kb_list}\n")
-        f.write(f"- pipe: {args.pipe_list}\n")
-        f.write(f"- tma_issue_warp: {args.tma_issue_warp}\n")
-        f.write(f"- simple_slice_kb: {args.simple_slice_kb_list}\n")
-        f.write(f"- tma_slice_kb: {args.tma_slice_kb_list}\n")
-        f.write(f"- tma_tile_kb: {args.tma_tile_kb_list}\n")
-        f.write("\n")
-
-        f.write("## Top 10 by TMA BW\n\n")
-        f.write(
-            markdown_table(
-                top_bw,
-                [
-                    "total_mb", "grid", "block", "smem_kb", "pipe",
-                    "tma_issue_warp",
-                    "simple_slice_kb", "tma_slice_kb", "tma_tile_kb",
-                    "tma_bw_gbps_mean", "simple_bw_gbps_mean", "speedup_bw_tma_over_simple",
-                    "tma_us_mean", "simple_us_mean",
-                ],
-            )
-        )
-        f.write("\n\n")
-
-        f.write("## Top 10 by Speedup (TMA BW / Simple BW)\n\n")
-        f.write(
-            markdown_table(
-                top_speedup,
-                [
-                    "total_mb", "grid", "block", "smem_kb", "pipe",
-                    "tma_issue_warp",
-                    "simple_slice_kb", "tma_slice_kb", "tma_tile_kb",
-                    "speedup_bw_tma_over_simple", "tma_bw_gbps_mean", "simple_bw_gbps_mean",
-                    "tma_us_mean", "simple_us_mean",
-                ],
-            )
-        )
-        f.write("\n")
-
     print("[done]")
+    print(f"  wall time  : {done_s:.1f} s")
+    print(f"  runs ok    : {ok_total}")
+    print(f"  runs not ok: {fail_total}")
     print(f"  raw runs   : {raw_path}")
     print(f"  summary csv: {summary_path}")
-    print(f"  summary md : {md_path}")
     if skipped:
         print(f"  skipped cfg: {out_dir / 'skipped_configs.csv'}")
 
