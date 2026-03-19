@@ -6,6 +6,7 @@
 
 #define NCCL_TMA_PIPE_DEPTH 2
 #define NCCL_TMA_SLOT_SIZE (32 * 1024)
+#define NCCL_TMA_UNROLL 4
 
 #ifndef ENABLE_PROFILING
 #define ENABLE_PROFILING 1
@@ -547,14 +548,14 @@ private:
               if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
                   && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
                 if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
-                  reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                  reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
                     (tid, tmaComputeWorkers, /*redArg*/0, /*postOp*/false,
                     1, ncclShmem.groups[group].srcs,
                     fan.nsend(), ncclShmem.groups[group].dsts+1,
                     workSize);
                 }
               } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
-                reduceCopyShared<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+                reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
                   (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
                   Recv, ncclShmem.groups[group].srcs,
                   Dst, ncclShmem.groups[group].dsts,
@@ -562,7 +563,7 @@ private:
               } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
                 constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
                 if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
-                  reduceCopyShared<Unroll, RedOp, T,
+                  reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T,
                     0, Recv + Src, Recv * MaxRecv + Src,
                     0, 1, 1, PreOpSrcs>
                     (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
@@ -570,7 +571,7 @@ private:
                       1, ncclShmem.groups[group].dsts,
                       workSize);
                 } else {
-                  reduceCopyShared<Unroll, RedOp, T,
+                  reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T,
                     MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
                     MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
                     (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,

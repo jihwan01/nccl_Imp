@@ -123,26 +123,8 @@ __global__ void kernel_simple_transfer(
     if (prof != nullptr && tid == 0) t0 = clock64();
 
     const size_t stride = size_t(blockDim.x);
-    size_t v = tid;
-    for (; v + 7 * stride < curr_vecs; v += 8 * stride) {
-      uint4 x0 = src_v[vec_base + v + 0 * stride];
-      uint4 x1 = src_v[vec_base + v + 1 * stride];
-      uint4 x2 = src_v[vec_base + v + 2 * stride];
-      uint4 x3 = src_v[vec_base + v + 3 * stride];
-      uint4 x4 = src_v[vec_base + v + 4 * stride];
-      uint4 x5 = src_v[vec_base + v + 5 * stride];
-      uint4 x6 = src_v[vec_base + v + 6 * stride];
-      uint4 x7 = src_v[vec_base + v + 7 * stride];
-      dst_v[vec_base + v + 0 * stride] = x0;
-      dst_v[vec_base + v + 1 * stride] = x1;
-      dst_v[vec_base + v + 2 * stride] = x2;
-      dst_v[vec_base + v + 3 * stride] = x3;
-      dst_v[vec_base + v + 4 * stride] = x4;
-      dst_v[vec_base + v + 5 * stride] = x5;
-      dst_v[vec_base + v + 6 * stride] = x6;
-      dst_v[vec_base + v + 7 * stride] = x7;
-    }
-    for (; v < curr_vecs; v += stride) {
+    #pragma unroll 8
+    for (size_t v = tid; v < curr_vecs; v += stride) {
       uint4 x = src_v[vec_base + v];
       dst_v[vec_base + v] = x;
     }
@@ -288,26 +270,8 @@ __global__ void kernel_tma_transfer(
 
       if (is_tma_compute_thread) {
         const size_t stride = size_t(tma_compute_workers);
-        size_t v = tid;
-        for (; v + 7 * stride < vec_count; v += 8 * stride) {
-          uint4 x0 = smem_v[v + 0 * stride];
-          uint4 x1 = smem_v[v + 1 * stride];
-          uint4 x2 = smem_v[v + 2 * stride];
-          uint4 x3 = smem_v[v + 3 * stride];
-          uint4 x4 = smem_v[v + 4 * stride];
-          uint4 x5 = smem_v[v + 5 * stride];
-          uint4 x6 = smem_v[v + 6 * stride];
-          uint4 x7 = smem_v[v + 7 * stride];
-          dst_v[dst_vec_base + v + 0 * stride] = x0;
-          dst_v[dst_vec_base + v + 1 * stride] = x1;
-          dst_v[dst_vec_base + v + 2 * stride] = x2;
-          dst_v[dst_vec_base + v + 3 * stride] = x3;
-          dst_v[dst_vec_base + v + 4 * stride] = x4;
-          dst_v[dst_vec_base + v + 5 * stride] = x5;
-          dst_v[dst_vec_base + v + 6 * stride] = x6;
-          dst_v[dst_vec_base + v + 7 * stride] = x7;
-        }
-        for (; v < vec_count; v += stride) {
+        #pragma unroll 4
+        for (size_t v = tid; v < vec_count; v += stride) {
           uint4 x = smem_v[v];
           dst_v[dst_vec_base + v] = x;
         }
