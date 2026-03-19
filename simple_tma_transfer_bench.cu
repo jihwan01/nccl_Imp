@@ -50,43 +50,12 @@ struct Args {
   size_t tma_slice_kb = 1024;    // 1MB default
   size_t tma_tile_kb = 32;       // 32KB default
 
-  int detail = 1;
   int verify = 1;
-};
-
-struct TmaKernelStats {
-  unsigned long long wait_cycles = 0ULL;
-  unsigned long long issue_cycles = 0ULL;
-  unsigned long long store_cycles = 0ULL;
-  unsigned long long wait_samples = 0ULL;
-  unsigned long long issue_samples = 0ULL;
-  unsigned long long store_samples = 0ULL;
-  unsigned long long blocks = 0ULL;
-};
-
-struct SimpleKernelStats {
-  unsigned long long io_cycles = 0ULL;
-  unsigned long long io_samples = 0ULL;
-  unsigned long long blocks = 0ULL;
-};
-
-struct CommDetail {
-  double wait_ns = 0.0;
-  double issue_ns = 0.0;
-  double store_ns = 0.0;
-  double io_ns = 0.0;
-
-  unsigned long long wait_samples = 0ULL;
-  unsigned long long issue_samples = 0ULL;
-  unsigned long long store_samples = 0ULL;
-  unsigned long long io_samples = 0ULL;
-  unsigned long long blocks = 0ULL;
 };
 
 struct BenchResult {
   float avg_ms = 0.0f;
   float gbps = 0.0f;
-  CommDetail detail{};
 };
 
 __device__ __forceinline__ size_t div_up(size_t a, size_t b) {
@@ -102,44 +71,30 @@ __global__ void kernel_simple_transfer(
     bf16* __restrict__ dst_peer,
     const bf16* __restrict__ src,
     size_t chunk_bytes,
-    size_t simple_slice_bytes,
-    SimpleKernelStats* __restrict__ prof) {
+    size_t simple_slice_bytes) {
   const size_t tid = threadIdx.x;
+  const int nworkers = blockDim.x;
+  constexpr int kWarpSize = 32;
+  const int simple_compute_workers =
+      (nworkers >= 2 * kWarpSize) ? (nworkers - kWarpSize) : nworkers;
   const size_t cta_start = blockIdx.x * chunk_bytes;
 
   const uint4* src_v = reinterpret_cast<const uint4*>(src);
   uint4* dst_v = reinterpret_cast<uint4*>(dst_peer);
-
-  unsigned long long io_cycles_local = 0ULL;
-  unsigned long long io_samples_local = 0ULL;
 
   for (size_t slice_off = 0; slice_off < chunk_bytes; slice_off += simple_slice_bytes) {
     const size_t curr_slice_bytes = min(simple_slice_bytes, chunk_bytes - slice_off);
     const size_t curr_vecs = curr_slice_bytes / 16;
     const size_t vec_base = (cta_start + slice_off) / 16;
 
-    if (prof != nullptr) __syncthreads();
-    unsigned long long t0 = 0ULL;
-    if (prof != nullptr && tid == 0) t0 = clock64();
-
-    const size_t stride = size_t(blockDim.x);
-    #pragma unroll 8
-    for (size_t v = tid; v < curr_vecs; v += stride) {
-      uint4 x = src_v[vec_base + v];
-      dst_v[vec_base + v] = x;
+    if (int(tid) < simple_compute_workers) {
+      const size_t stride = size_t(simple_compute_workers);
+      #pragma unroll 8
+      for (size_t v = tid; v < curr_vecs; v += stride) {
+        uint4 x = src_v[vec_base + v];
+        dst_v[vec_base + v] = x;
+      }
     }
-
-    __syncthreads();
-    if (prof != nullptr && tid == 0) {
-      io_cycles_local += (clock64() - t0);
-      io_samples_local += 1ULL;
-    }
-  }
-
-  if (prof != nullptr && tid == 0) {
-    atomicAdd(&prof->io_cycles, io_cycles_local);
-    atomicAdd(&prof->io_samples, io_samples_local);
-    atomicAdd(&prof->blocks, 1ULL);
   }
 }
 
@@ -158,10 +113,6 @@ __global__ void kernel_simple_transfer(
  *   - Prologue preloads up to `pipe_depth` tiles.
  *   - Main loop consumes one tile and issues one future tile into the freed slot.
  *
- * Timing (optional, prof != nullptr):
- *   - issue: enqueue memcpy_async into a slot
- *   - wait : barrier wait for tile readiness
- *   - store: shared -> peer global vector stores
  */
 __global__ void kernel_tma_transfer(
     bf16* __restrict__ dst_peer,
@@ -171,8 +122,7 @@ __global__ void kernel_tma_transfer(
     size_t tma_tile_bytes,
     size_t tma_slot_bytes,
     int pipe_depth,
-    int enable_issue_warp,
-    TmaKernelStats* __restrict__ prof) {
+    int enable_issue_warp) {
   extern __shared__ __align__(16) unsigned char smem_all[];
 
   // One barrier/token per pipeline slot.
@@ -193,6 +143,8 @@ __global__ void kernel_tma_transfer(
   // NCCL-like warp specialization:
   // reserve one warp for async issue when block has at least 2 warps.
   constexpr int kWarpSize = 32;
+  constexpr int kCopyUnroll = 8;
+  constexpr size_t kCopyBytesPerWarp = size_t(kCopyUnroll) * size_t(kWarpSize) * 16ULL;
   const bool allow_issue_warp = (enable_issue_warp != 0) && (pipe_depth >= 2);
   const int tma_compute_workers =
       (allow_issue_warp && nworkers >= 2 * kWarpSize) ? (nworkers - kWarpSize) : nworkers;
@@ -209,13 +161,6 @@ __global__ void kernel_tma_transfer(
   }
   __syncthreads();
 
-  unsigned long long wait_cycles_local = 0ULL;
-  unsigned long long issue_cycles_local = 0ULL;
-  unsigned long long store_cycles_local = 0ULL;
-  unsigned long long wait_samples_local = 0ULL;
-  unsigned long long issue_samples_local = 0ULL;
-  unsigned long long store_samples_local = 0ULL;
-
   // Process the CTA chunk slice by slice.
   for (size_t slice_off = 0; slice_off < chunk_bytes; slice_off += tma_slice_bytes) {
     const size_t curr_slice_bytes = min(tma_slice_bytes, chunk_bytes - slice_off);
@@ -230,17 +175,11 @@ __global__ void kernel_tma_transfer(
       const int slot = in_flight % pipe_depth;
 
       if (is_tma_issuer_thread) {
-        unsigned long long t0 = 0ULL;
-        if (prof != nullptr) t0 = clock64();
         cuda::memcpy_async(
             smem_slot[slot],
             reinterpret_cast<const unsigned char*>(src) + cta_start + slice_off + tile_off,
             cuda::aligned_size_t<16>(copy_bytes),
             bars[slot]);
-        if (prof != nullptr) {
-          issue_cycles_local += (clock64() - t0);
-          issue_samples_local += 1ULL;
-        }
       }
       tokens[slot] = bars[slot].arrive();
     }
@@ -251,26 +190,23 @@ __global__ void kernel_tma_transfer(
       const size_t tile_off = t * tma_tile_bytes;
       const size_t copy_bytes = min(tma_tile_bytes, curr_slice_bytes - tile_off);
       const size_t vec_count = copy_bytes / 16;
-
-      if (prof != nullptr && threadIdx.x == 0) {
-        unsigned long long t0 = clock64();
-        bars[slot].wait(std::move(tokens[slot]));
-        wait_cycles_local += (clock64() - t0);
-        wait_samples_local += 1ULL;
-      } else {
-        bars[slot].wait(std::move(tokens[slot]));
-      }
-
-      if (prof != nullptr) __syncthreads();
-      unsigned long long t0_store = 0ULL;
-      if (prof != nullptr && threadIdx.x == 0) t0_store = clock64();
+      bars[slot].wait(std::move(tokens[slot]));
 
       const uint4* smem_v = reinterpret_cast<const uint4*>(smem_slot[slot]);
       const size_t dst_vec_base = (cta_start + slice_off + tile_off) / 16;
 
-      if (is_tma_compute_thread) {
-        const size_t stride = size_t(tma_compute_workers);
-        #pragma unroll 4
+      // Match NCCL reduceCopyShared behavior: active warps are limited by
+      // tile bytes and unroll factor (Unroll * warpSize * 16B per hunk).
+      int max_compute_warps = tma_compute_workers / kWarpSize;
+      if (max_compute_warps < 1) max_compute_warps = 1;
+      int active_compute_warps = int((copy_bytes + kCopyBytesPerWarp - 1) / kCopyBytesPerWarp);
+      if (active_compute_warps > max_compute_warps) active_compute_warps = max_compute_warps;
+      int active_compute_threads = active_compute_warps * kWarpSize;
+      if (active_compute_threads > tma_compute_workers) active_compute_threads = tma_compute_workers;
+
+      if (is_tma_compute_thread && int(tid) < active_compute_threads) {
+        const size_t stride = size_t(active_compute_threads);
+        #pragma unroll 8
         for (size_t v = tid; v < vec_count; v += stride) {
           uint4 x = smem_v[v];
           dst_v[dst_vec_base + v] = x;
@@ -278,10 +214,6 @@ __global__ void kernel_tma_transfer(
       }
 
       __syncthreads();
-      if (prof != nullptr && threadIdx.x == 0) {
-        store_cycles_local += (clock64() - t0_store);
-        store_samples_local += 1ULL;
-      }
 
       // 3) Refill:
       // Always keep ring-buffer semantics correct: refill slot (t % pipe_depth)
@@ -292,44 +224,16 @@ __global__ void kernel_tma_transfer(
         const size_t issue_copy_bytes = min(tma_tile_bytes, curr_slice_bytes - issue_off);
 
         if (is_tma_issuer_thread) {
-          unsigned long long t0 = 0ULL;
-          if (prof != nullptr) t0 = clock64();
           cuda::memcpy_async(
               smem_slot[slot],
               reinterpret_cast<const unsigned char*>(src) + cta_start + slice_off + issue_off,
               cuda::aligned_size_t<16>(issue_copy_bytes),
               bars[slot]);
-          if (prof != nullptr) {
-            issue_cycles_local += (clock64() - t0);
-            issue_samples_local += 1ULL;
-          }
         }
         tokens[slot] = bars[slot].arrive();
       }
     }
   }
-
-  if (prof != nullptr && threadIdx.x == 0) {
-    atomicAdd(&prof->wait_cycles, wait_cycles_local);
-    atomicAdd(&prof->issue_cycles, issue_cycles_local);
-    atomicAdd(&prof->store_cycles, store_cycles_local);
-    atomicAdd(&prof->wait_samples, wait_samples_local);
-    atomicAdd(&prof->issue_samples, issue_samples_local);
-    atomicAdd(&prof->store_samples, store_samples_local);
-    atomicAdd(&prof->blocks, 1ULL);
-  }
-}
-
-static inline int device_clock_khz(int dev) {
-  int clock_khz = 0;
-  cudaError_t st = cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, dev);
-  if (st != cudaSuccess) return 0;
-  return clock_khz;
-}
-
-static inline double cycles_to_ns(unsigned long long cycles, int clock_khz) {
-  if (clock_khz <= 0) return 0.0;
-  return double(cycles) * (1.0e6 / double(clock_khz));
 }
 
 static inline void parse_args(int argc, char** argv, Args& a) {
@@ -353,7 +257,7 @@ static inline void parse_args(int argc, char** argv, Args& a) {
              "  --tma_tile_kb N       TMA tile size in KB (default: 32)\\n"
              "                        NOTE: TMA enforces slot_bytes == tile_bytes, so smem_kb must satisfy\\n"
              "                              smem_kb*1024 == tma_tile_kb*1024*pipe\\n"
-             "  --detail N            0=off, 1=on (default: 1)\\n"
+             "  --detail N            Ignored (kept for script compatibility)\\n"
              "  --verify N            0=off, 1=on (default: 1)\\n");
       std::exit(0);
     }
@@ -379,7 +283,7 @@ static inline void parse_args(int argc, char** argv, Args& a) {
     else if (k == "--simple_slice_kb") { need(1); a.simple_slice_kb = std::stoull(argv[++i]); }
     else if (k == "--tma_slice_kb") { need(1); a.tma_slice_kb = std::stoull(argv[++i]); }
     else if (k == "--tma_tile_kb") { need(1); a.tma_tile_kb = std::stoull(argv[++i]); }
-    else if (k == "--detail") { need(1); a.detail = std::stoi(argv[++i]); }
+    else if (k == "--detail") { need(1); ++i; }
     else if (k == "--verify") { need(1); a.verify = std::stoi(argv[++i]); }
     else {
       fprintf(stderr, "Unknown arg: %s\\n", k.c_str());
@@ -495,20 +399,14 @@ static BenchResult run_simple(
     bf16* d_dst,
     const bf16* d_src,
     size_t total_bytes,
-    size_t chunk_bytes,
-    size_t simple_slice_bytes) {
+  size_t chunk_bytes,
+  size_t simple_slice_bytes) {
   BenchResult out;
 
-  SimpleKernelStats* d_prof = nullptr;
-  SimpleKernelStats h_prof{};
-  if (a.detail) CUDA_CHECK(cudaMalloc(&d_prof, sizeof(SimpleKernelStats)));
-
   for (int i = 0; i < a.warmup; ++i) {
-    kernel_simple_transfer<<<a.grid, a.block, 0>>>(d_dst, d_src, chunk_bytes, simple_slice_bytes, nullptr);
+    kernel_simple_transfer<<<a.grid, a.block, 0>>>(d_dst, d_src, chunk_bytes, simple_slice_bytes);
   }
   CUDA_CHECK(cudaDeviceSynchronize());
-
-  if (a.detail) CUDA_CHECK(cudaMemset(d_prof, 0, sizeof(SimpleKernelStats)));
 
   cudaEvent_t start, stop;
   CUDA_CHECK(cudaEventCreate(&start));
@@ -516,7 +414,7 @@ static BenchResult run_simple(
 
   CUDA_CHECK(cudaEventRecord(start));
   for (int it = 0; it < a.iters; ++it) {
-    kernel_simple_transfer<<<a.grid, a.block, 0>>>(d_dst, d_src, chunk_bytes, simple_slice_bytes, d_prof);
+    kernel_simple_transfer<<<a.grid, a.block, 0>>>(d_dst, d_src, chunk_bytes, simple_slice_bytes);
   }
   CUDA_CHECK(cudaEventRecord(stop));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -527,17 +425,6 @@ static BenchResult run_simple(
 
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
-
-  if (a.detail) {
-    CUDA_CHECK(cudaMemcpy(&h_prof, d_prof, sizeof(SimpleKernelStats), cudaMemcpyDeviceToHost));
-    int clk = device_clock_khz(a.src_dev);
-    out.detail.blocks = h_prof.blocks;
-    out.detail.io_samples = h_prof.io_samples;
-    if (h_prof.io_samples > 0ULL) {
-      out.detail.io_ns = cycles_to_ns(h_prof.io_cycles, clk) / double(h_prof.io_samples);
-    }
-    CUDA_CHECK(cudaFree(d_prof));
-  }
 
   return out;
 }
@@ -560,17 +447,11 @@ static BenchResult run_tma(
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       int(smem_bytes)));
 
-  TmaKernelStats* d_prof = nullptr;
-  TmaKernelStats h_prof{};
-  if (a.detail) CUDA_CHECK(cudaMalloc(&d_prof, sizeof(TmaKernelStats)));
-
   for (int i = 0; i < a.warmup; ++i) {
     kernel_tma_transfer<<<a.grid, a.block, smem_bytes>>>(
-        d_dst, d_src, chunk_bytes, tma_slice_bytes, tma_tile_bytes, tma_slot_bytes, a.pipe, tma_issue_warp, nullptr);
+        d_dst, d_src, chunk_bytes, tma_slice_bytes, tma_tile_bytes, tma_slot_bytes, a.pipe, tma_issue_warp);
   }
   CUDA_CHECK(cudaDeviceSynchronize());
-
-  if (a.detail) CUDA_CHECK(cudaMemset(d_prof, 0, sizeof(TmaKernelStats)));
 
   cudaEvent_t start, stop;
   CUDA_CHECK(cudaEventCreate(&start));
@@ -579,7 +460,7 @@ static BenchResult run_tma(
   CUDA_CHECK(cudaEventRecord(start));
   for (int it = 0; it < a.iters; ++it) {
     kernel_tma_transfer<<<a.grid, a.block, smem_bytes>>>(
-        d_dst, d_src, chunk_bytes, tma_slice_bytes, tma_tile_bytes, tma_slot_bytes, a.pipe, tma_issue_warp, d_prof);
+        d_dst, d_src, chunk_bytes, tma_slice_bytes, tma_tile_bytes, tma_slot_bytes, a.pipe, tma_issue_warp);
   }
   CUDA_CHECK(cudaEventRecord(stop));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -590,26 +471,6 @@ static BenchResult run_tma(
 
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
-
-  if (a.detail) {
-    CUDA_CHECK(cudaMemcpy(&h_prof, d_prof, sizeof(TmaKernelStats), cudaMemcpyDeviceToHost));
-    int clk = device_clock_khz(a.src_dev);
-    out.detail.blocks = h_prof.blocks;
-    out.detail.wait_samples = h_prof.wait_samples;
-    out.detail.issue_samples = h_prof.issue_samples;
-    out.detail.store_samples = h_prof.store_samples;
-
-    if (h_prof.wait_samples > 0ULL) {
-      out.detail.wait_ns = cycles_to_ns(h_prof.wait_cycles, clk) / double(h_prof.wait_samples);
-    }
-    if (h_prof.issue_samples > 0ULL) {
-      out.detail.issue_ns = cycles_to_ns(h_prof.issue_cycles, clk) / double(h_prof.issue_samples);
-    }
-    if (h_prof.store_samples > 0ULL) {
-      out.detail.store_ns = cycles_to_ns(h_prof.store_cycles, clk) / double(h_prof.store_samples);
-    }
-    CUDA_CHECK(cudaFree(d_prof));
-  }
 
   return out;
 }
@@ -703,11 +564,6 @@ int main(int argc, char** argv) {
 
     const float avg_us = r.avg_ms * 1000.0f;
     printf("[TMA]    avg=%.3f us  BW=%.2f GB/s  wrong=%zu\\n", avg_us, r.gbps, wrong_tma);
-    if (a.detail) {
-      printf("         detail(wait/issue/store) ns = %.3f / %.3f / %.3f  samples = %llu / %llu / %llu  blocks=%llu\\n",
-             r.detail.wait_ns, r.detail.issue_ns, r.detail.store_ns,
-             r.detail.wait_samples, r.detail.issue_samples, r.detail.store_samples, r.detail.blocks);
-    }
   }
 
   if (a.proto == 0 || a.proto == 2) {
@@ -721,10 +577,6 @@ int main(int argc, char** argv) {
 
     const float avg_us = r.avg_ms * 1000.0f;
     printf("[SIMPLE] avg=%.3f us  BW=%.2f GB/s  wrong=%zu\\n", avg_us, r.gbps, wrong_simple);
-    if (a.detail) {
-      printf("         detail(io) ns = %.3f  samples = %llu  blocks=%llu\\n",
-             r.detail.io_ns, r.detail.io_samples, r.detail.blocks);
-    }
   }
 
   CUDA_CHECK(cudaSetDevice(a.src_dev));
