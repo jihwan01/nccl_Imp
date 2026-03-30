@@ -38,6 +38,7 @@ def parse_log(filename):
     chunk_data = []
     slice_data = []
     tile_data = []
+    pack_data = []
     
     # Regex patterns
     # NCCL_PROFILE_CHUNK,channelId,chunkId,OP,time
@@ -46,10 +47,31 @@ def parse_log(filename):
     p_slice = re.compile(r"NCCL_PROFILE_SLICE,(\d+),(\d+),(\d+),([\w_]+),(\d+)")
     # NCCL_PROFILE_TILE,channelId,chunkId,slice,tile,TYPE,time
     p_tile = re.compile(r"NCCL_PROFILE_TILE,(\d+),(\d+),(\d+),(\d+),([\w_]+),(\d+)")
+    # NCCL_PROFILE_PACKS,GLOBAL|SHARED,unroll=...,pack=...,iters=...,load_total=...,store_total=...,load_avg=...,store_avg=...
+    p_packs = re.compile(
+        r"NCCL_PROFILE_PACKS,([A-Z_]+),"
+        r"unroll=(\d+),pack=(\d+),iters=(\d+),"
+        r"load_total=(\d+),store_total=(\d+),"
+        r"load_avg=(\d+),store_avg=(\d+)"
+    )
 
     with open(filename, 'r') as f:
         for line in f:
             line = line.strip()
+            m_packs = p_packs.search(line)
+            if m_packs:
+                pack_data.append({
+                    'MemoryPath': m_packs.group(1),
+                    'Unroll': int(m_packs.group(2)),
+                    'BytePerPack': int(m_packs.group(3)),
+                    'Iterations': int(m_packs.group(4)),
+                    'Load_Total_Cycles': int(m_packs.group(5)),
+                    'Store_Total_Cycles': int(m_packs.group(6)),
+                    'Load_Avg_Cycles': int(m_packs.group(7)),
+                    'Store_Avg_Cycles': int(m_packs.group(8))
+                })
+                continue
+
             # Check most specific first to avoid partial matches if any
             m_tile = p_tile.search(line)
             if m_tile:
@@ -84,7 +106,12 @@ def parse_log(filename):
                 })
                 continue
                 
-    return pd.DataFrame(chunk_data), pd.DataFrame(slice_data), pd.DataFrame(tile_data)
+    return (
+        pd.DataFrame(chunk_data),
+        pd.DataFrame(slice_data),
+        pd.DataFrame(tile_data),
+        pd.DataFrame(pack_data),
+    )
 
 def main():
     parser = argparse.ArgumentParser(description="Process NCCL Profile Logs (including TILE)")
@@ -95,10 +122,10 @@ def main():
     args = parser.parse_args()
 
     print(f"Parsing {args.logfile}...")
-    df_chunk, df_slice, df_tile = parse_log(args.logfile)
+    df_chunk, df_slice, df_tile, df_pack = parse_log(args.logfile)
     meta = parse_header(args.logfile)
 
-    if df_chunk.empty and df_slice.empty and df_tile.empty:
+    if df_chunk.empty and df_slice.empty and df_tile.empty and df_pack.empty:
         print("No profile data found in log.")
         sys.exit(1)
 
@@ -108,6 +135,12 @@ def main():
     for df in [df_chunk, df_slice, df_tile]:
         if not df.empty:
             df['Time_us'] = df['Time_Cycles'] / (args.freq * 1000.0)
+
+    if not df_pack.empty:
+        df_pack['Load_Total_us'] = df_pack['Load_Total_Cycles'] / (args.freq * 1000.0)
+        df_pack['Store_Total_us'] = df_pack['Store_Total_Cycles'] / (args.freq * 1000.0)
+        df_pack['Load_Avg_us'] = df_pack['Load_Avg_Cycles'] / (args.freq * 1000.0)
+        df_pack['Store_Avg_us'] = df_pack['Store_Avg_Cycles'] / (args.freq * 1000.0)
 
     dfs_to_save = {}
 
@@ -160,6 +193,33 @@ def main():
 
         tile_summary_global = df_tile.groupby(['BlockType'])[time_col].agg(['mean', 'max', 'min', 'count']).reset_index()
         dfs_to_save['Tile_Summary_Global'] = tile_summary_global
+
+    # 4. Pack Timing Data
+    if not df_pack.empty:
+        df_pack = df_pack.sort_values(by=['MemoryPath', 'Unroll', 'BytePerPack'])
+        dfs_to_save['Pack_Raw'] = df_pack
+
+        pack_summary = df_pack.groupby(['MemoryPath', 'Unroll', 'BytePerPack']).agg(
+            Samples=('Iterations', 'count'),
+            Iterations_Total=('Iterations', 'sum'),
+            Load_Total_Cycles_Mean=('Load_Total_Cycles', 'mean'),
+            Load_Total_Cycles_Max=('Load_Total_Cycles', 'max'),
+            Load_Total_Cycles_Min=('Load_Total_Cycles', 'min'),
+            Store_Total_Cycles_Mean=('Store_Total_Cycles', 'mean'),
+            Store_Total_Cycles_Max=('Store_Total_Cycles', 'max'),
+            Store_Total_Cycles_Min=('Store_Total_Cycles', 'min'),
+            Load_Avg_Cycles_Mean=('Load_Avg_Cycles', 'mean'),
+            Load_Avg_Cycles_Max=('Load_Avg_Cycles', 'max'),
+            Load_Avg_Cycles_Min=('Load_Avg_Cycles', 'min'),
+            Store_Avg_Cycles_Mean=('Store_Avg_Cycles', 'mean'),
+            Store_Avg_Cycles_Max=('Store_Avg_Cycles', 'max'),
+            Store_Avg_Cycles_Min=('Store_Avg_Cycles', 'min'),
+            Load_Total_us_Mean=('Load_Total_us', 'mean'),
+            Store_Total_us_Mean=('Store_Total_us', 'mean'),
+            Load_Avg_us_Mean=('Load_Avg_us', 'mean'),
+            Store_Avg_us_Mean=('Store_Avg_us', 'mean'),
+        ).reset_index()
+        dfs_to_save['Pack_Summary'] = pack_summary
 
 
     date_str = datetime.now().strftime("%Y%m%d_%H%M%S")

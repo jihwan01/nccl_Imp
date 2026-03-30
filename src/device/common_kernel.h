@@ -15,6 +15,10 @@
 
 #include <cuda_runtime.h>
 
+#ifndef ENABLE_REDUCE_COPY_PACKS_TIMING
+#define ENABLE_REDUCE_COPY_PACKS_TIMING 0
+#endif
+
 // Define min for ssize_t
 inline __device__ int min(int a, ssize_t b) { return (a < b) ? a : b; }
 
@@ -64,6 +68,13 @@ __device__ __forceinline__ void reduceCopyPacks(
   RedFn redFn(redArg);
   uintptr_t minSrcs[MinSrcs + !MinSrcs];
   uintptr_t minDsts[MinDsts + !MinDsts];
+  #if ENABLE_REDUCE_COPY_PACKS_TIMING
+  const int entryThread = thread;
+  const bool profileThread = entryThread == 0 && blockIdx.x == 0 && ncclShmem.channelId == 0;
+  unsigned long long totalLoadCycles = 0;
+  unsigned long long totalStoreCycles = 0;
+  unsigned int profileIters = 0;
+  #endif
   #pragma unroll
   for (int s=0; s < MinSrcs; s++) {
     minSrcs[s] = cvta_to_global(srcPtrFn(s)) + threadBytesBehind;
@@ -80,6 +91,10 @@ __device__ __forceinline__ void reduceCopyPacks(
   // can be handled or not.
   while (Unroll==1 ? (BytePerPack <= threadBytesAhead) : (0 < nHunksAhead)) {
     BytePack<BytePerPack> acc[Unroll];
+    #if ENABLE_REDUCE_COPY_PACKS_TIMING
+    unsigned long long tLoadStart = 0, tLoadEnd = 0, tStoreEnd = 0;
+    if (profileThread) tLoadStart = clock64();
+    #endif
 
     // minSrcs[0] cannot be nullptr so we always process it
     {
@@ -146,6 +161,9 @@ __device__ __forceinline__ void reduceCopyPacks(
       for (int u=0; u < Unroll; u++)
         acc[u] = applyPostOp(redFn, acc[u]);
     }
+    #if ENABLE_REDUCE_COPY_PACKS_TIMING
+    if (profileThread) tLoadEnd = clock64();
+    #endif
 
     #pragma unroll (MinDsts + !MinDsts)
     for (int d=0; d < MinDsts; d++) {
@@ -171,6 +189,14 @@ __device__ __forceinline__ void reduceCopyPacks(
         dst += WARP_SIZE*BytePerPack;
       }
     }
+    #if ENABLE_REDUCE_COPY_PACKS_TIMING
+    if (profileThread) {
+      tStoreEnd = clock64();
+      totalLoadCycles += tLoadEnd - tLoadStart;
+      totalStoreCycles += tStoreEnd - tLoadEnd;
+      profileIters += 1;
+    }
+    #endif
 
     nWarps = nThreads/WARP_SIZE;
     #pragma unroll
@@ -199,6 +225,15 @@ __device__ __forceinline__ void reduceCopyPacks(
   // This effectively assigns: warp = (warp-nHunks+nWarps)%nWarps;
   warp = -nHunksAhead;
   thread = warp*WARP_SIZE + lane;
+
+  #if ENABLE_REDUCE_COPY_PACKS_TIMING
+  if (profileThread && profileIters > 0) {
+    printf("NCCL_PROFILE_PACKS,GLOBAL,unroll=%d,pack=%d,iters=%u,load_total=%llu,store_total=%llu,load_avg=%llu,store_avg=%llu\n",
+           Unroll, BytePerPack, profileIters,
+           totalLoadCycles, totalStoreCycles,
+           totalLoadCycles / profileIters, totalStoreCycles / profileIters);
+  }
+  #endif
 }
 
 template<int Unroll, typename RedFn, typename T,
@@ -313,6 +348,13 @@ __device__ __forceinline__ void reduceCopyPacksShared(
   RedFn redFn(redArg);
   uintptr_t minSrcs[MinSrcs + !MinSrcs];
   uintptr_t minDsts[MinDsts + !MinDsts];
+  #if ENABLE_REDUCE_COPY_PACKS_TIMING
+  const int entryThread = thread;
+  const bool profileThread = entryThread == 0 && blockIdx.x == 0 && ncclShmem.channelId == 0;
+  unsigned long long totalLoadCycles = 0;
+  unsigned long long totalStoreCycles = 0;
+  unsigned int profileIters = 0;
+  #endif
   #pragma unroll
   for (int s=0; s < MinSrcs; s++) {
     minSrcs[s] = (uintptr_t)(srcPtrFn(s)) + threadBytesBehind;
@@ -325,6 +367,10 @@ __device__ __forceinline__ void reduceCopyPacksShared(
 
   while (Unroll==1 ? (BytePerPack <= threadBytesAhead) : (0 < nHunksAhead)) {
     BytePack<BytePerPack> acc[Unroll];
+    #if ENABLE_REDUCE_COPY_PACKS_TIMING
+    unsigned long long tLoadStart = 0, tLoadEnd = 0, tStoreEnd = 0;
+    if (profileThread) tLoadStart = clock64();
+    #endif
 
     {
       #pragma unroll Unroll
@@ -378,6 +424,9 @@ __device__ __forceinline__ void reduceCopyPacksShared(
       for (int u=0; u < Unroll; u++)
         acc[u] = applyPostOp(redFn, acc[u]);
     }
+    #if ENABLE_REDUCE_COPY_PACKS_TIMING
+    if (profileThread) tLoadEnd = clock64();
+    #endif
 
     #pragma unroll (MinDsts + !MinDsts)
     for (int d=0; d < MinDsts; d++) {
@@ -400,6 +449,14 @@ __device__ __forceinline__ void reduceCopyPacksShared(
         dst += WARP_SIZE*BytePerPack;
       }
     }
+    #if ENABLE_REDUCE_COPY_PACKS_TIMING
+    if (profileThread) {
+      tStoreEnd = clock64();
+      totalLoadCycles += tLoadEnd - tLoadStart;
+      totalStoreCycles += tStoreEnd - tLoadEnd;
+      profileIters += 1;
+    }
+    #endif
 
     nWarps = nThreads/WARP_SIZE;
     #pragma unroll
@@ -421,6 +478,15 @@ __device__ __forceinline__ void reduceCopyPacksShared(
   if (Unroll==1 && nHunksAhead > 0) nHunksAhead -= nWarps;
   warp = -nHunksAhead;
   thread = warp*WARP_SIZE + lane;
+
+  #if ENABLE_REDUCE_COPY_PACKS_TIMING
+  if (profileThread && profileIters > 0) {
+    printf("NCCL_PROFILE_PACKS,SHARED,unroll=%d,pack=%d,iters=%u,load_total=%llu,store_total=%llu,load_avg=%llu,store_avg=%llu\n",
+           Unroll, BytePerPack, profileIters,
+           totalLoadCycles, totalStoreCycles,
+           totalLoadCycles / profileIters, totalStoreCycles / profileIters);
+  }
+  #endif
 }
 
 template<int Unroll, typename RedFn, typename T,
