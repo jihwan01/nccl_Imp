@@ -70,7 +70,7 @@ __device__ __forceinline__ void reduceCopyPacks(
   uintptr_t minDsts[MinDsts + !MinDsts];
   #if ENABLE_REDUCE_COPY_PACKS_TIMING
   const int entryThread = thread;
-  const bool profileThread = entryThread == 0 && blockIdx.x == 0 && ncclShmem.channelId == 0;
+  const bool profileThread = entryThread == 0 && blockIdx.x == 0;
   unsigned long long totalLoadCycles = 0;
   unsigned long long totalStoreCycles = 0;
   unsigned int profileIters = 0;
@@ -350,7 +350,7 @@ __device__ __forceinline__ void reduceCopyPacksShared(
   uintptr_t minDsts[MinDsts + !MinDsts];
   #if ENABLE_REDUCE_COPY_PACKS_TIMING
   const int entryThread = thread;
-  const bool profileThread = entryThread == 0 && blockIdx.x == 0 && ncclShmem.channelId == 0;
+  const bool profileThread = entryThread == 0 && blockIdx.x == 0;
   unsigned long long totalLoadCycles = 0;
   unsigned long long totalStoreCycles = 0;
   unsigned int profileIters = 0;
