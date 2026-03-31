@@ -18,6 +18,16 @@ using bf16 = __nv_bfloat16;
 using barrier_t = cuda::barrier<cuda::thread_scope_block>;
 namespace ptx = cuda::ptx;
 
+#ifndef ENABLE_PROFILING
+#define ENABLE_PROFILING 1
+#endif
+#ifndef ENABLE_TILE_PROFILING
+#define ENABLE_TILE_PROFILING ENABLE_PROFILING
+#endif
+#ifndef ENABLE_SLICE_PROFILING
+#define ENABLE_SLICE_PROFILING ENABLE_PROFILING
+#endif
+
 #define CUDA_CHECK(cmd) do { \
   cudaError_t e = (cmd); \
   if (e != cudaSuccess) { \
@@ -158,9 +168,14 @@ __global__ void kernel_tma_transfer(
   __syncthreads();
 
   // Process the CTA chunk slice by slice.
-  for (size_t slice_off = 0; slice_off < chunk_bytes; slice_off += tma_slice_bytes) {
+  int slice_idx = 0;
+  for (size_t slice_off = 0; slice_off < chunk_bytes; slice_off += tma_slice_bytes, ++slice_idx) {
     const size_t curr_slice_bytes = min(tma_slice_bytes, chunk_bytes - slice_off);
     const size_t tile_count = (curr_slice_bytes + tma_tile_bytes - 1) / tma_tile_bytes;
+    #if ENABLE_SLICE_PROFILING
+    unsigned long long tSliceCopyStart = 0;
+    if (blockIdx.x == 0 && tid == 0) tSliceCopyStart = clock64();
+    #endif
 
     // 1) Prologue: preload up to pipe_depth tiles.
     int in_flight = 0;
@@ -170,6 +185,10 @@ __global__ void kernel_tma_transfer(
       const size_t copy_bytes = min(tma_tile_bytes, curr_slice_bytes - tile_off);
       const int slot = in_flight % pipe_depth;
 
+      #if ENABLE_TILE_PROFILING
+      unsigned long long tIssueStart = 0;
+      if (blockIdx.x == 0 && is_tma_issuer_thread) tIssueStart = clock64();
+      #endif
       if (is_tma_issuer_thread) {
         cuda::memcpy_async(
             smem_slot[slot],
@@ -177,8 +196,29 @@ __global__ void kernel_tma_transfer(
             cuda::aligned_size_t<16>(copy_bytes),
             bars[slot]);
       }
+      #if ENABLE_TILE_PROFILING
+      if (blockIdx.x == 0 && is_tma_issuer_thread) {
+        unsigned long long tIssueEnd = clock64();
+        printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,SEND_ISSUE_ENQ_PRELOAD,%llu\n", 0, 0, slice_idx, int(tile_idx), tIssueEnd - tIssueStart);
+      }
+      unsigned long long tArriveStart = 0;
+      if (blockIdx.x == 0 && tid == 0) tArriveStart = clock64();
+      #endif
       tokens[slot] = bars[slot].arrive();
+      #if ENABLE_TILE_PROFILING
+      if (blockIdx.x == 0 && tid == 0) {
+        unsigned long long tArriveEnd = clock64();
+        printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,SEND_ARRIVE_PRELOAD,%llu\n", 0, 0, slice_idx, int(tile_idx), tArriveEnd - tArriveStart);
+      }
+      #endif
     }
+    #if ENABLE_SLICE_PROFILING
+    if (blockIdx.x == 0 && tid == 0) {
+      unsigned long long tSliceCopyPreEnd = clock64();
+      printf("NCCL_PROFILE_SLICE,%d,%d,%d,SEND_COPY_PRE,%llu\n", 0, 0, slice_idx, tSliceCopyPreEnd - tSliceCopyStart);
+      tSliceCopyStart = clock64();
+    }
+    #endif
 
     // 2) Steady state: wait/consume current tile, then issue next tile.
     for (size_t t = 0; t < tile_count; ++t) {
@@ -186,7 +226,20 @@ __global__ void kernel_tma_transfer(
       const size_t tile_off = t * tma_tile_bytes;
       const size_t copy_bytes = min(tma_tile_bytes, curr_slice_bytes - tile_off);
       const size_t vec_count = copy_bytes / 16;
+      #if ENABLE_TILE_PROFILING
+      unsigned long long tWaitStart = 0;
+      if (blockIdx.x == 0 && tid == 0) tWaitStart = clock64();
+      #endif
       bars[slot].wait(std::move(tokens[slot]));
+      #if ENABLE_TILE_PROFILING
+      unsigned long long tWaitEnd = 0;
+      if (blockIdx.x == 0 && tid == 0) {
+        tWaitEnd = clock64();
+        printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,SEND_WAIT,%llu\n", 0, 0, slice_idx, int(t), tWaitEnd - tWaitStart);
+      }
+      unsigned long long tCopyCoreStart = 0;
+      if (blockIdx.x == 0 && tid == 0) tCopyCoreStart = clock64();
+      #endif
 
       const uint4* smem_v = reinterpret_cast<const uint4*>(smem_slot[slot]);
       const size_t dst_vec_base = (cta_start + slice_off + tile_off) / 16;
@@ -208,8 +261,22 @@ __global__ void kernel_tma_transfer(
           dst_v[dst_vec_base + v] = x;
         }
       }
-
+      #if ENABLE_TILE_PROFILING
+      unsigned long long tCopyCoreEnd = 0;
+      if (blockIdx.x == 0 && tid == 0) {
+        tCopyCoreEnd = clock64();
+        printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,SEND_COPY_CORE,%llu\n", 0, 0, slice_idx, int(t), tCopyCoreEnd - tCopyCoreStart);
+      }
+      unsigned long long tTailSyncStart = 0;
+      if (blockIdx.x == 0 && tid == 0) tTailSyncStart = clock64();
+      #endif
       __syncthreads();
+      #if ENABLE_TILE_PROFILING
+      if (blockIdx.x == 0 && tid == 0) {
+        unsigned long long tTailSyncEnd = clock64();
+        printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,SEND_TAIL_SYNC,%llu\n", 0, 0, slice_idx, int(t), tTailSyncEnd - tTailSyncStart);
+      }
+      #endif
 
       // 3) Refill:
       // Always keep ring-buffer semantics correct: refill slot (t % pipe_depth)
@@ -219,6 +286,10 @@ __global__ void kernel_tma_transfer(
         const size_t issue_off = issue_idx * tma_tile_bytes;
         const size_t issue_copy_bytes = min(tma_tile_bytes, curr_slice_bytes - issue_off);
 
+        #if ENABLE_TILE_PROFILING
+        unsigned long long tIssueOverlapStart = 0;
+        if (blockIdx.x == 0 && is_tma_issuer_thread) tIssueOverlapStart = clock64();
+        #endif
         if (is_tma_issuer_thread) {
           cuda::memcpy_async(
               smem_slot[slot],
@@ -226,9 +297,29 @@ __global__ void kernel_tma_transfer(
               cuda::aligned_size_t<16>(issue_copy_bytes),
               bars[slot]);
         }
+        #if ENABLE_TILE_PROFILING
+        if (blockIdx.x == 0 && is_tma_issuer_thread) {
+          unsigned long long tIssueOverlapEnd = clock64();
+          printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,SEND_ISSUE_ENQ_OVERLAP,%llu\n", 0, 0, slice_idx, int(issue_idx), tIssueOverlapEnd - tIssueOverlapStart);
+        }
+        unsigned long long tArriveOverlapStart = 0;
+        if (blockIdx.x == 0 && tid == 0) tArriveOverlapStart = clock64();
+        #endif
         tokens[slot] = bars[slot].arrive();
+        #if ENABLE_TILE_PROFILING
+        if (blockIdx.x == 0 && tid == 0) {
+          unsigned long long tArriveOverlapEnd = clock64();
+          printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,SEND_ARRIVE_OVERLAP,%llu\n", 0, 0, slice_idx, int(issue_idx), tArriveOverlapEnd - tArriveOverlapStart);
+        }
+        #endif
       }
     }
+    #if ENABLE_SLICE_PROFILING
+    if (blockIdx.x == 0 && tid == 0) {
+      unsigned long long tSliceCopyMainEnd = clock64();
+      printf("NCCL_PROFILE_SLICE,%d,%d,%d,SEND_COPY_MAIN,%llu\n", 0, 0, slice_idx, tSliceCopyMainEnd - tSliceCopyStart);
+    }
+    #endif
   }
 }
 
