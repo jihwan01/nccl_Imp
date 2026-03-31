@@ -263,11 +263,11 @@ private:
     const bool isTmaIssuerThread = tid == (hasDedicatedTmaIssueWarp ? tmaComputeWorkers : 0);
 
     if (tid < nworkers && offset < nelem && !isNetOffload) {
-        if (useTma) {
-          if (tid == 0) {
-            #pragma unroll
-            for (int i=0; i<NCCL_TMA_PIPE_DEPTH; ++i) init(&barriers[i], nworkers);
-          }
+      if (useTma) {
+        if (tid == 0) {
+          #pragma unroll
+          for (int i=0; i<NCCL_TMA_PIPE_DEPTH; ++i) init(&barriers[i], nworkers);
+        }
         subBarrier();
 
         // Slice-level waitPeer, tile-level TMA pipeline
@@ -697,14 +697,14 @@ private:
             if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
           }
 
-#if ENABLE_SLICE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           long long t0 = clock64();
-#endif
+          #endif
 
           waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
           subBarrier();
 
-#if ENABLE_SLICE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           long long t1_wait = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_wait - t0;
@@ -712,8 +712,8 @@ private:
             printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
           t0 = clock64();
-#endif
-        
+          #endif
+          
           int workSize = ncclShmem.aborted ? 0 : sliceSize;
           if (flags & AnyNetDeviceUnpack) {
             ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
@@ -725,16 +725,16 @@ private:
             if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
               reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
                 (tid, nworkers, /*redArg*/0, /*postOp*/false,
-                 1, ncclShmem.groups[group].srcs,
-                 fan.nsend(), ncclShmem.groups[group].dsts+1,
-                 workSize);
+                  1, ncclShmem.groups[group].srcs,
+                  fan.nsend(), ncclShmem.groups[group].dsts+1,
+                  workSize);
             }
           } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
             reduceCopy<Unroll, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
               (tid, nworkers, ncclShmem.groups[group].redOpArgs, postOp,
-               Recv, ncclShmem.groups[group].srcs,
-               Dst, ncclShmem.groups[group].dsts,
-               workSize);
+                Recv, ncclShmem.groups[group].srcs,
+                Dst, ncclShmem.groups[group].dsts,
+                workSize);
           } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
             constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
             if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
@@ -759,7 +759,7 @@ private:
           }
           barrier();
 
-#if ENABLE_SLICE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           long long t1_copy = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_copy - t0;
@@ -767,18 +767,18 @@ private:
             printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
           t0 = clock64();
-#endif
+          #endif
 
           postPeer<Recv, Send>(0 < workSize);
 
-#if ENABLE_SLICE_PROFILING
+          #if ENABLE_SLICE_PROFILING
           long long t1_post = clock64();
           if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
             long long dt = t1_post - t0;
             const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
             printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_POST,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
-#endif
+          #endif
 
           offset += sliceSize;
           slice += 1;

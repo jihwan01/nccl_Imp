@@ -4,6 +4,7 @@ import argparse
 import pandas as pd
 from datetime import datetime
 import os
+import subprocess
 
 def parse_header(filename):
     meta = {
@@ -113,17 +114,82 @@ def parse_log(filename):
         pd.DataFrame(pack_data),
     )
 
+def default_output_base(meta, log_path):
+    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_name = f"nccl_profile_{date_str}_{meta['Protocol']}_{meta['Size']}_{meta['GPUs']}gpu"
+    log_dir = os.path.dirname(os.path.abspath(log_path))
+    return os.path.join(log_dir, default_name).replace(" ", "")
+
+def run_and_capture(args):
+    if not args.run_script:
+        return args.logfile
+
+    if not args.output:
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output = os.path.join(os.getcwd(), f"nccl_profile_run_{date_str}")
+
+    log_path = args.logfile if args.logfile else args.output + ".log"
+    cmd = [args.run_script] + args.run_arg
+    if not os.access(args.run_script, os.X_OK):
+        cmd = ["bash", args.run_script] + args.run_arg
+
+    env = os.environ.copy()
+    for item in args.env:
+        if "=" not in item:
+            raise ValueError(f"--env must be KEY=VALUE, got: {item}")
+        key, value = item.split("=", 1)
+        env[key] = value
+
+    cwd = args.run_cwd if args.run_cwd else None
+
+    print("Running command:")
+    print("  " + " ".join(cmd))
+    print(f"Logging to: {log_path}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+    with open(log_path, "w") as logf:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=cwd,
+            env=env,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            logf.write(line)
+        rc = proc.wait()
+
+    if rc != 0:
+        raise RuntimeError(f"Run failed with exit code {rc}. Log saved to {log_path}")
+    return log_path
+
 def main():
     parser = argparse.ArgumentParser(description="Process NCCL Profile Logs (including TILE)")
-    parser.add_argument("logfile", help="Path to log file")
+    parser.add_argument("logfile", help="Path to log file", nargs='?')
     parser.add_argument("output", help="Optional output filename prefix", nargs='?')
     parser.add_argument("--freq", type=float, help="GPU frequency in GHz for time conversion (e.g., 1.98)", default=1.0)
+    parser.add_argument("--run-script", help="Run a script first, capture stdout/stderr to a log, then process that log")
+    parser.add_argument("--run-arg", action="append", default=[], help="Argument to pass to --run-script (repeatable)")
+    parser.add_argument("--run-cwd", help="Working directory for --run-script")
+    parser.add_argument("--env", action="append", default=[], help="Extra env for --run-script in KEY=VALUE form")
     
     args = parser.parse_args()
+    if not args.logfile and not args.run_script:
+        parser.error("either logfile or --run-script is required")
 
-    print(f"Parsing {args.logfile}...")
-    df_chunk, df_slice, df_tile, df_pack = parse_log(args.logfile)
-    meta = parse_header(args.logfile)
+    try:
+        log_path = run_and_capture(args)
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    print(f"Parsing {log_path}...")
+    df_chunk, df_slice, df_tile, df_pack = parse_log(log_path)
+    meta = parse_header(log_path)
 
     if df_chunk.empty and df_slice.empty and df_tile.empty and df_pack.empty:
         print("No profile data found in log.")
@@ -222,11 +288,8 @@ def main():
         dfs_to_save['Pack_Summary'] = pack_summary
 
 
-    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_name = f"nccl_profile_{date_str}_{meta['Protocol']}_{meta['Size']}_{meta['GPUs']}gpu.xlsx"
-    # Default output directory follows the input log location, not current cwd.
-    log_dir = os.path.dirname(os.path.abspath(args.logfile))
-    out_name = args.output if args.output else os.path.join(log_dir, default_name)
+    out_base = args.output if args.output else default_output_base(meta, log_path)
+    out_name = out_base
     if not out_name.endswith('.xlsx'):
         out_name += '.xlsx'
     

@@ -58,10 +58,6 @@ struct BenchResult {
   float gbps = 0.0f;
 };
 
-__device__ __forceinline__ size_t div_up(size_t a, size_t b) {
-  return (a + b - 1) / b;
-}
-
 __global__ void init_src_bf16(bf16* src, size_t n) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) src[i] = __float2bfloat16(float(i % 4096));
@@ -164,7 +160,7 @@ __global__ void kernel_tma_transfer(
   // Process the CTA chunk slice by slice.
   for (size_t slice_off = 0; slice_off < chunk_bytes; slice_off += tma_slice_bytes) {
     const size_t curr_slice_bytes = min(tma_slice_bytes, chunk_bytes - slice_off);
-    const size_t tile_count = div_up(curr_slice_bytes, tma_tile_bytes);
+    const size_t tile_count = (curr_slice_bytes + tma_tile_bytes - 1) / tma_tile_bytes;
 
     // 1) Prologue: preload up to pipe_depth tiles.
     int in_flight = 0;
