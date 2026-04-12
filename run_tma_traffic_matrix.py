@@ -74,9 +74,11 @@ def run_cmd(cmd, cwd, log_path=None, timeout_sec=0):
                 if timeout_sec > 0 and (datetime.now() - start).total_seconds() > timeout_sec:
                     proc.kill()
                     proc.wait()
+                    tail = "".join(output[-40:])
                     raise TimeoutError(
                         f"command timed out after {timeout_sec}s: {' '.join(cmd)}\n"
-                        f"log: {log_path if log_path else '<not saved>'}"
+                        f"log: {log_path if log_path else '<not saved>'}\n"
+                        f"last output lines:\n{tail}"
                     )
         rc = proc.returncode
     except KeyboardInterrupt:
@@ -178,6 +180,7 @@ def summarize(rows):
             row["traffic_mb"],
             row["traffic_grid"],
             row["traffic_block"],
+            row["traffic_rounds"],
             row["total_mb"],
             row["grid"],
             row["block"],
@@ -203,13 +206,14 @@ def summarize(rows):
                 "traffic_mb": key[3],
                 "traffic_grid": key[4],
                 "traffic_block": key[5],
-                "total_mb": key[6],
-                "grid": key[7],
-                "block": key[8],
-                "pipe": key[9],
-                "smem_kb": key[10],
-                "tma_slice_kb": key[11],
-                "tma_tile_kb": key[12],
+                "traffic_rounds": key[6],
+                "total_mb": key[7],
+                "grid": key[8],
+                "block": key[9],
+                "pipe": key[10],
+                "smem_kb": key[11],
+                "tma_slice_kb": key[12],
+                "tma_tile_kb": key[13],
                 "runs": len(group),
                 "wrong_max": max(r["wrong"] for r in group),
                 "avg_us_mean": mean(avg_us),
@@ -234,6 +238,7 @@ def summarize_tile_events(rows):
             row["traffic_mb"],
             row["traffic_grid"],
             row["traffic_block"],
+            row["traffic_rounds"],
             row["total_mb"],
             row["grid"],
             row["block"],
@@ -255,13 +260,14 @@ def summarize_tile_events(rows):
             "traffic_mb": key[3],
             "traffic_grid": key[4],
             "traffic_block": key[5],
-            "total_mb": key[6],
-            "grid": key[7],
-            "block": key[8],
-            "pipe": key[9],
-            "smem_kb": key[10],
-            "tma_slice_kb": key[11],
-            "tma_tile_kb": key[12],
+            "traffic_rounds": key[6],
+            "total_mb": key[7],
+            "grid": key[8],
+            "block": key[9],
+            "pipe": key[10],
+            "smem_kb": key[11],
+            "tma_slice_kb": key[12],
+            "tma_tile_kb": key[13],
             "samples": len(group),
             "time_cycles_mean": mean(cycles),
             "time_cycles_stdev": stdev(cycles),
@@ -354,6 +360,7 @@ def main():
     parser.add_argument("--traffic-mb", type=int, default=1024)
     parser.add_argument("--traffic-grid", type=int, default=16)
     parser.add_argument("--traffic-block", type=int, default=256)
+    parser.add_argument("--traffic-rounds", type=int, default=64, help="Traffic sweeps over its buffer; 0=infinite.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -393,6 +400,7 @@ def main():
                     "--traffic_mb", str(args.traffic_mb),
                     "--traffic_grid", str(args.traffic_grid),
                     "--traffic_block", str(args.traffic_block),
+                    "--traffic_rounds", str(args.traffic_rounds),
                 ]
                 print(f"[run] mode={mode} target={target_label} rep={rep}")
                 stdout = run_cmd(cmd, root, log_path, args.timeout_sec)
@@ -409,6 +417,7 @@ def main():
                             "traffic_mb": args.traffic_mb,
                             "traffic_grid": args.traffic_grid,
                             "traffic_block": args.traffic_block,
+                            "traffic_rounds": args.traffic_rounds,
                             "total_mb": args.total_mb,
                             "grid": args.grid,
                             "block": args.block,
@@ -430,6 +439,7 @@ def main():
                             "traffic_mb": args.traffic_mb,
                             "traffic_grid": args.traffic_grid,
                             "traffic_block": args.traffic_block,
+                            "traffic_rounds": args.traffic_rounds,
                             "total_mb": args.total_mb,
                             "grid": args.grid,
                             "block": args.block,

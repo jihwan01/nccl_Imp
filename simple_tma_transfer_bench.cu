@@ -77,6 +77,7 @@ struct Args {
   size_t traffic_mb = 256;
   int traffic_grid = 32;
   int traffic_block = 256;
+  int traffic_rounds = 64;
 
   int verify = 1;
 };
@@ -119,13 +120,14 @@ __global__ void kernel_mem_traffic(
     const uint4* __restrict__ src,
     size_t vec_count,
     int mode,
+    int rounds,
     volatile int* stop_flag,
     unsigned int* sink) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
   unsigned int acc = 0x9e3779b9u ^ unsigned(tid);
 
-  while (*stop_flag == 0) {
+  for (int round = 0; (rounds <= 0 || round < rounds) && *stop_flag == 0; ++round) {
     for (size_t i = tid; i < vec_count; i += stride) {
       uint4 x = make_uint4(0u, 0u, 0u, 0u);
       if (mode != int(TrafficMode::Write)) {
@@ -494,6 +496,7 @@ static inline void parse_args(int argc, char** argv, Args& a) {
              "  --traffic_mb N        Background traffic buffer size in MB per target GPU (default: 256)\\n"
              "  --traffic_grid N      Background traffic CTAs (default: 32)\\n"
              "  --traffic_block N     Background traffic threads per CTA (default: 256)\\n"
+             "  --traffic_rounds N    Finite sweeps over traffic buffer; 0=infinite (default: 64)\\n"
              "  --detail N            Ignored (kept for script compatibility)\\n"
              "  --verify N            0=off, 1=on (default: 1)\\n");
       std::exit(0);
@@ -525,6 +528,7 @@ static inline void parse_args(int argc, char** argv, Args& a) {
     else if (k == "--traffic_mb") { need(1); a.traffic_mb = std::stoull(argv[++i]); }
     else if (k == "--traffic_grid") { need(1); a.traffic_grid = std::stoi(argv[++i]); }
     else if (k == "--traffic_block") { need(1); a.traffic_block = std::stoi(argv[++i]); }
+    else if (k == "--traffic_rounds") { need(1); a.traffic_rounds = std::stoi(argv[++i]); }
     else if (k == "--detail") { need(1); ++i; }
     else if (k == "--verify") { need(1); a.verify = std::stoi(argv[++i]); }
     else {
@@ -570,6 +574,10 @@ static inline void validate_or_die(
     }
     if (a.traffic_grid <= 0 || a.traffic_block <= 0) {
       fprintf(stderr, "--traffic_grid and --traffic_block must be > 0 when traffic is enabled\\n");
+      std::exit(2);
+    }
+    if (a.traffic_rounds < 0) {
+      fprintf(stderr, "--traffic_rounds must be >= 0\\n");
       std::exit(2);
     }
   }
@@ -721,6 +729,7 @@ static inline void start_traffic_instance(const Args& a, int dev, TrafficInstanc
       inst.d_src,
       vec_count,
       int(a.traffic_mode),
+      a.traffic_rounds,
       inst.d_stop,
       inst.d_sink);
   CUDA_CHECK(cudaGetLastError());
@@ -933,12 +942,12 @@ int main(int argc, char** argv) {
   printf("[CONFIG] total=%zu MB grid=%d block=%d iters=%d warmup=%d src=%d dst=%d\\n"
          "         proto=%d pipe=%d issue_warp=always smem=%zu KB (slot=%zu B)\\n"
          "         simple_slice=%zu KB | tma_slice=%zu KB tma_tile=%zu KB\\n"
-         "         traffic=%s target=%s traffic_mb=%zu traffic_grid=%d traffic_block=%d\\n",
+         "         traffic=%s target=%s traffic_mb=%zu traffic_grid=%d traffic_block=%d traffic_rounds=%d\\n",
          a.total_mb, a.grid, a.block, a.iters, a.warmup, a.src_dev, a.dst_dev,
          a.proto, a.pipe, a.smem_kb, tma_slot_bytes,
          a.simple_slice_kb, a.tma_slice_kb, a.tma_tile_kb,
          traffic_mode_str(a.traffic_mode), traffic_target_str(a.traffic_target),
-         a.traffic_mb, a.traffic_grid, a.traffic_block);
+         a.traffic_mb, a.traffic_grid, a.traffic_block, a.traffic_rounds);
 
   size_t wrong_tma = 0;
   size_t wrong_simple = 0;
