@@ -3,6 +3,7 @@ import argparse
 import csv
 import os
 import re
+import selectors
 import statistics
 import subprocess
 from datetime import datetime
@@ -41,22 +42,53 @@ def percentile(values, q):
     return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac
 
 
-def run_cmd(cmd, cwd, log_path=None):
-    proc = subprocess.run(
+def run_cmd(cmd, cwd, log_path=None, timeout_sec=0):
+    proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    if log_path is not None:
-        log_path.write_text(proc.stdout)
-    if proc.returncode != 0:
+    assert proc.stdout is not None
+    output = []
+    start = datetime.now()
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    try:
+        with (log_path.open("w") if log_path is not None else open(os.devnull, "w")) as logf:
+            while True:
+                for key, _ in selector.select(timeout=0.2):
+                    line = key.fileobj.readline()
+                    if line:
+                        output.append(line)
+                        logf.write(line)
+                        logf.flush()
+                rc = proc.poll()
+                if rc is not None:
+                    rest = proc.stdout.read()
+                    if rest:
+                        output.append(rest)
+                        logf.write(rest)
+                    break
+                if timeout_sec > 0 and (datetime.now() - start).total_seconds() > timeout_sec:
+                    proc.kill()
+                    proc.wait()
+                    raise TimeoutError(
+                        f"command timed out after {timeout_sec}s: {' '.join(cmd)}\n"
+                        f"log: {log_path if log_path else '<not saved>'}"
+                    )
+        rc = proc.returncode
+    except KeyboardInterrupt:
+        proc.kill()
+        proc.wait()
+        raise
+    if rc != 0:
         raise RuntimeError(
-            f"command failed with exit code {proc.returncode}: {' '.join(cmd)}\n"
+            f"command failed with exit code {rc}: {' '.join(cmd)}\n"
             f"log: {log_path if log_path else '<not saved>'}"
         )
-    return proc.stdout
+    return "".join(output)
 
 
 def compile_bench(args, root):
@@ -299,6 +331,7 @@ def main():
     parser.add_argument("--extra-nvcc-flags", default="")
     parser.add_argument("--tile-profile", action="store_true", help="Enable tile profiling and parse all NCCL_PROFILE_TILE rows.")
     parser.add_argument("--freq-ghz", type=float, default=1.0, help="clock64 frequency for cycles->us conversion.")
+    parser.add_argument("--timeout-sec", type=int, default=0, help="Kill one benchmark run after this many seconds; 0 disables.")
 
     parser.add_argument("--total-mb", type=int, default=128)
     parser.add_argument("--grid", type=int, default=32)
@@ -362,7 +395,7 @@ def main():
                     "--traffic_block", str(args.traffic_block),
                 ]
                 print(f"[run] mode={mode} target={target_label} rep={rep}")
-                stdout = run_cmd(cmd, root, log_path)
+                stdout = run_cmd(cmd, root, log_path, args.timeout_sec)
                 parsed = parse_result(stdout, proto_name)
                 if not parsed:
                     raise RuntimeError(f"no result line parsed from {log_path}")
