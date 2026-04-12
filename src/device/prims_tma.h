@@ -273,6 +273,11 @@ private:
         // Slice-level waitPeer, tile-level TMA pipeline
         char* tmaShmemBase = (char*)ncclTmaShmemPtr();
         T* tmaSliceBaseSrc = nullptr;
+        constexpr int MaxTileSrcs = Recv * MaxRecv + Src;
+        constexpr int MaxTileDsts = Send * MaxSend + Dst;
+        constexpr int TmaSharedAlign = 16;
+        void* sliceSrcBases[MaxTileSrcs + !MaxTileSrcs];
+        void* sliceDstBases[MaxTileDsts + !MaxTileDsts];
 
         while (slice < SlicePerChunk && offset < nelem) {
           int currSliceSize = (sliceSize < nelem-offset) ? sliceSize : nelem-offset;
@@ -311,6 +316,32 @@ private:
 
           // Store slice base pointers once waitPeer/setup is complete.
           tmaSliceBaseSrc = (T*)ncclShmem.groups[group].srcs[0];
+          #pragma unroll
+          for (int i = 0; i < MaxTileSrcs; ++i) {
+            sliceSrcBases[i] = ncclShmem.groups[group].srcs[i];
+          }
+          #pragma unroll
+          for (int i = 0; i < MaxTileDsts; ++i) {
+            sliceDstBases[i] = ncclShmem.groups[group].dsts[i];
+          }
+          bool sliceSharedBigPackAligned = true;
+          // TODO: If TMA shared-memory alignment becomes configurable, validate
+          // tmaShmemBase and NCCL_TMA_SLOT_SIZE here.
+          sliceSharedBigPackAligned &= ((tmaTileSize * (int)sizeof(T)) % TmaSharedAlign) == 0;
+          #pragma unroll
+          for (int i = 1; i < MaxTileSrcs; ++i) {
+            void* srcBase = sliceSrcBases[i];
+            if (srcBase != nullptr) {
+              sliceSharedBigPackAligned &= ((uintptr_t)srcBase % TmaSharedAlign) == 0;
+            }
+          }
+          #pragma unroll
+          for (int i = 0; i < MaxTileDsts; ++i) {
+            void* dstBase = sliceDstBases[i];
+            if (dstBase != nullptr) {
+              sliceSharedBigPackAligned &= (cvta_to_global(dstBase) % TmaSharedAlign) == 0;
+            }
+          }
 
           int sliceTiles = (currSliceSize + tmaTileSize - 1) / tmaTileSize;
           int preloadCount = min(NCCL_TMA_PIPE_DEPTH, sliceTiles);
@@ -333,33 +364,13 @@ private:
               t0 = clock64();
               #endif
 
-              #if __CUDA_ARCH__ >= 900
-                if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
-                  cuda::device::memcpy_async_tx(
-                      (char*)shmemDst,
-                      (char*)globalSrc,
-                      cuda::aligned_size_t<16>(copySize),
-                      barriers[tmaSlot]
-                  );
-                  tmaTokens[tmaSlot] = cuda::device::barrier_arrive_tx(barriers[tmaSlot], 1, copySize);
-                } else {
-                  cuda::memcpy_async(
-                      shmemDst,
-                      globalSrc,
-                      copySize,
-                      barriers[tmaSlot]
-                  );
-                  tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
-                }
-              #else
-              cuda::memcpy_async(
-                  shmemDst,
-                  globalSrc,
-                  copySize,
+              cuda::device::memcpy_async_tx(
+                  (char*)shmemDst,
+                  (char*)globalSrc,
+                  cuda::aligned_size_t<16>(copySize),
                   barriers[tmaSlot]
               );
-              tmaTokens[tmaSlot] = barriers[tmaSlot].arrive();
-              #endif
+              tmaTokens[tmaSlot] = cuda::device::barrier_arrive_tx(barriers[tmaSlot], 1, copySize);
 
 
               #if ENABLE_TILE_PROFILING
@@ -426,34 +437,42 @@ private:
             // CONSUME
             // =======
 
-            const int localGroup = group;
-            constexpr int MaxTileSrcs = Recv * MaxRecv + Src;
-            constexpr int MaxTileDsts = Send * MaxSend + Dst;
-            void* tileSrcs[MaxTileSrcs + !MaxTileSrcs];
-            void* tileDsts[MaxTileDsts + !MaxTileDsts];
-            #pragma unroll
-            for (int i = 0; i < MaxTileSrcs; ++i) {
-              T* srcBase = (T*)ncclShmem.groups[localGroup].srcs[i];
-              tileSrcs[i] = srcBase == nullptr ? nullptr : srcBase + tileOffset;
+            #if ENABLE_TILE_PROFILING
+            long long tTilePtrSetupStart = clock64();
+            #endif
+
+            T* tileSrc0 = MaxTileSrcs > 0 ? (T*)(tmaShmemBase + tmaSlot * NCCL_TMA_SLOT_SIZE) : nullptr;
+            T* tileDst0 = nullptr;
+            if (MaxTileDsts > 0) {
+              T* dstBase = (T*)sliceDstBases[0];
+              tileDst0 = dstBase == nullptr ? nullptr : dstBase + tileOffset;
             }
-            #pragma unroll
-            for (int i = 0; i < MaxTileDsts; ++i) {
-              T* dstBase = (T*)ncclShmem.groups[localGroup].dsts[i];
-              tileDsts[i] = dstBase == nullptr ? nullptr : dstBase + tileOffset;
+            T* tileDst1 = nullptr;
+            if (MaxTileDsts > 1) {
+              T* dstBase = (T*)sliceDstBases[1];
+              tileDst1 = dstBase == nullptr ? nullptr : dstBase + tileOffset;
             }
-            if (MaxTileSrcs > 0) tileSrcs[0] = tmaShmemBase + tmaSlot * NCCL_TMA_SLOT_SIZE;
-            T* tileSrc0 = MaxTileSrcs > 0 ? (T*)tileSrcs[0] : nullptr;
-            T* tileDst0 = MaxTileDsts > 0 ? (T*)tileDsts[0] : nullptr;
-            T* tileDst1 = MaxTileDsts > 1 ? (T*)tileDsts[1] : nullptr;
             auto tileSrcPtr = [=] __device__ (int i) -> void* {
-              return tileSrcs[i];
+              if (i == 0) return tmaShmemBase + tmaSlot * NCCL_TMA_SLOT_SIZE;
+              T* srcBase = (T*)sliceSrcBases[i];
+              return srcBase == nullptr ? nullptr : srcBase + tileOffset;
             };
             auto tileDstPtr = [=] __device__ (int i) -> void* {
-              return tileDsts[i];
+              T* dstBase = (T*)sliceDstBases[i];
+              return dstBase == nullptr ? nullptr : dstBase + tileOffset;
             };
             auto tileDstPtrFrom1 = [=] __device__ (int i) -> void* {
-              return tileDsts[i + 1];
+              T* dstBase = (T*)sliceDstBases[i + 1];
+              return dstBase == nullptr ? nullptr : dstBase + tileOffset;
             };
+
+            #if ENABLE_TILE_PROFILING
+            long long tTilePtrSetupEnd = clock64();
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = tTilePtrSetupEnd - tTilePtrSetupStart;
+              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_TILE_PTR_SETUP,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
+            }
+            #endif
 
             #if ENABLE_TILE_PROFILING
             long long tPtrWarpSpecStart = clock64();
@@ -519,11 +538,19 @@ private:
                   #if ENABLE_TILE_PROFILING
                   copyPath = "DIRECT_RECV_FWD";
                   #endif
-                  reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
-                    (tid, tmaComputeWorkers, /*redArg*/0, /*postOp*/false,
-                    1, tileSrcPtr,
-                    fan.nsend(), tileDstPtrFrom1,
-                    workSize);
+                  if (sliceSharedBigPackAligned) {
+                    reduceCopySharedAligned<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                      (tid, tmaComputeWorkers, /*redArg*/0, /*postOp*/false,
+                      1, tileSrcPtr,
+                      fan.nsend(), tileDstPtrFrom1,
+                      workSize);
+                  } else {
+                    reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                      (tid, tmaComputeWorkers, /*redArg*/0, /*postOp*/false,
+                      1, tileSrcPtr,
+                      fan.nsend(), tileDstPtrFrom1,
+                      workSize);
+                  }
                 } else {
                   #if ENABLE_TILE_PROFILING
                   copyPath = "DIRECT_RECV_SKIP";
@@ -533,35 +560,63 @@ private:
                 #if ENABLE_TILE_PROFILING
                 copyPath = "DIRECT_SEND_NULL_DST";
                 #endif
-                reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
-                  (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
-                  Recv, tileSrcPtr,
-                  Dst, tileDstPtr,
-                  workSize);
+                if (sliceSharedBigPackAligned) {
+                  reduceCopySharedAligned<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+                    (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                    Recv, tileSrcPtr,
+                    Dst, tileDstPtr,
+                    workSize);
+                } else {
+                  reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+                    (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                    Recv, tileSrcPtr,
+                    Dst, tileDstPtr,
+                    workSize);
+                }
               } else if (tileSrc0 && tileDst0) {
                 constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
                 if (Send && Dst && tileDst1 == nullptr) {
                   #if ENABLE_TILE_PROFILING
                   copyPath = "GENERIC_SINGLE_DST";
                   #endif
-                  reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T,
-                    0, Recv + Src, Recv * MaxRecv + Src,
-                    0, 1, 1, PreOpSrcs>
-                    (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
-                      Recv * fan.nrecv() + Src, tileSrcPtr,
-                      1, tileDstPtr,
-                      workSize);
+                  if (sliceSharedBigPackAligned) {
+                    reduceCopySharedAligned<NCCL_TMA_UNROLL, RedOp, T,
+                      0, Recv + Src, Recv * MaxRecv + Src,
+                      0, 1, 1, PreOpSrcs>
+                      (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                        Recv * fan.nrecv() + Src, tileSrcPtr,
+                        1, tileDstPtr,
+                        workSize);
+                  } else {
+                    reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T,
+                      0, Recv + Src, Recv * MaxRecv + Src,
+                      0, 1, 1, PreOpSrcs>
+                      (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                        Recv * fan.nrecv() + Src, tileSrcPtr,
+                        1, tileDstPtr,
+                        workSize);
+                  }
                 } else {
                   #if ENABLE_TILE_PROFILING
                   copyPath = "GENERIC_MULTI_DST";
                   #endif
-                  reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T,
-                    MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
-                    MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-                    (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
-                      Recv * fan.nrecv() + Src, tileSrcPtr,
-                      Send * fan.nsend() + Dst, tileDstPtr,
-                      workSize);
+                  if (sliceSharedBigPackAligned) {
+                    reduceCopySharedAligned<NCCL_TMA_UNROLL, RedOp, T,
+                      MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+                      MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+                      (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                        Recv * fan.nrecv() + Src, tileSrcPtr,
+                        Send * fan.nsend() + Dst, tileDstPtr,
+                        workSize);
+                  } else {
+                    reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T,
+                      MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+                      MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+                      (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
+                        Recv * fan.nrecv() + Src, tileSrcPtr,
+                        Send * fan.nsend() + Dst, tileDstPtr,
+                        workSize);
+                  }
                 }
               } else {
                 #if ENABLE_TILE_PROFILING
@@ -589,33 +644,13 @@ private:
               long long tIssueStart = clock64();
               #endif
 
-              #if __CUDA_ARCH__ >= 900
-                if (copySize % 16 == 0 && (uintptr_t)globalSrc % 16 == 0) {
-                  cuda::device::memcpy_async_tx(
-                      (char*)shmemDst,
-                      (char*)globalSrc,
-                      cuda::aligned_size_t<16>(copySize),
-                      barriers[issueSlot]
-                  );
-                  tmaTokens[issueSlot] = cuda::device::barrier_arrive_tx(barriers[issueSlot], 1, copySize);
-                } else {
-                  cuda::memcpy_async(
-                      shmemDst,
-                      globalSrc,
-                      copySize,
-                      barriers[issueSlot]
-                  );
-                  tmaTokens[issueSlot] = barriers[issueSlot].arrive();
-                }
-              #else
-              cuda::memcpy_async(
-                  shmemDst,
-                  globalSrc,
-                  copySize,
+              cuda::device::memcpy_async_tx(
+                  (char*)shmemDst,
+                  (char*)globalSrc,
+                  cuda::aligned_size_t<16>(copySize),
                   barriers[issueSlot]
               );
-              tmaTokens[issueSlot] = barriers[issueSlot].arrive();
-              #endif
+              tmaTokens[issueSlot] = cuda::device::barrier_arrive_tx(barriers[issueSlot], 1, copySize);
 
               #if ENABLE_TILE_PROFILING
               long long t1_issue_overlap = clock64();

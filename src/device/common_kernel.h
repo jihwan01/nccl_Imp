@@ -497,6 +497,57 @@ template<int Unroll, typename RedFn, typename T,
          int MultimemSrcs, int MinSrcs, int MaxSrcs,
          int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
          typename IntBytes, typename SrcPtrFn, typename DstPtrFn>
+__device__ __forceinline__ void reduceCopySharedAligned(
+    int thread, int nThreads,
+    uint64_t redArg, bool postOp,
+    int nSrcs, SrcPtrFn const &srcPtrFn, int nDsts, DstPtrFn const &dstPtrFn,
+    IntBytes nElts
+  ) {
+  static_assert(MultimemSrcs <= MinSrcs && MultimemDsts <= MinDsts, "Multimem pointers cannot exceed respective Min values.");
+  constexpr int BigPackSize = (MultimemSrcs == 0) ? 16 : LoadMultimem_BigPackSize<RedFn>::BigPackSize;
+
+  if (MaxDsts==0) return;
+  if (MinDsts==0 && nDsts==0) return;
+
+  IntBytes nBytesBehind = 0;
+  IntBytes nBytesAhead = nElts*sizeof(T);
+
+  // Caller has prevalidated BigPackSize alignment for all active src/dst
+  // pointers. This avoids repeating the warp-wide alignment vote per TMA tile.
+  #if __cpp_if_constexpr
+  if constexpr (BigPackSize > sizeof(T)) {
+  #else
+  if (BigPackSize > sizeof(T)) {
+  #endif
+    reduceCopyPacksShared<RedFn, T, Unroll, BigPackSize,
+      MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+      (nThreads, /*&*/thread, redArg, postOp,
+       nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
+    if (nBytesAhead == 0) return;
+
+    reduceCopyPacksShared<RedFn, T, /*Unroll=*/1, BigPackSize,
+      MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+      (nThreads, /*&*/thread, redArg, postOp,
+       nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
+    if (nBytesAhead == 0) return;
+  }
+
+  reduceCopyPacksShared<RedFn, T, Unroll*(16/sizeof(T))/2, /*BytePerPack=*/sizeof(T),
+    MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+    (nThreads, /*&*/thread, redArg, postOp,
+     nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
+  if (nBytesAhead == 0) return;
+
+  reduceCopyPacksShared<RedFn, T, /*Unroll=*/1, /*BytePerPack=*/sizeof(T),
+    MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+    (nThreads, /*&*/thread, redArg, postOp,
+     nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
+}
+
+template<int Unroll, typename RedFn, typename T,
+         int MultimemSrcs, int MinSrcs, int MaxSrcs,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         typename IntBytes, typename SrcPtrFn, typename DstPtrFn>
 __device__ __forceinline__ void reduceCopyShared(
     int thread, int nThreads,
     uint64_t redArg, bool postOp,
