@@ -347,6 +347,7 @@ __device__ __forceinline__ void reduceCopyPacksShared(
 
   RedFn redFn(redArg);
   uintptr_t minSrcs[MinSrcs + !MinSrcs];
+  uint32_t minShSrcs[MinSrcs + !MinSrcs];
   uintptr_t minDsts[MinDsts + !MinDsts];
   #if ENABLE_REDUCE_COPY_PACKS_TIMING
   const int entryThread = thread;
@@ -357,7 +358,9 @@ __device__ __forceinline__ void reduceCopyPacksShared(
   #endif
   #pragma unroll
   for (int s=0; s < MinSrcs; s++) {
-    minSrcs[s] = (uintptr_t)(srcPtrFn(s)) + threadBytesBehind;
+    uintptr_t src = (uintptr_t)(srcPtrFn(s)) + threadBytesBehind;
+    if (s < MultimemSrcs) minSrcs[s] = src;
+    else minShSrcs[s] = cvta_to_shared((void*)src);
   }
 
   #pragma unroll
@@ -377,13 +380,12 @@ __device__ __forceinline__ void reduceCopyPacksShared(
       for (int u=0; u < Unroll; u++) {
         if (0 < MultimemSrcs) {
           acc[u] = applyLoadMultimem<RedFn, BytePerPack>(redFn, minSrcs[0]);
+          minSrcs[0] += WARP_SIZE*BytePerPack;
         } else {
-          // Use ld_shared for optimal shared memory loading (replacing pointer cast)
-          // minSrcs[0] is uintptr_t, casting to uint32_t gives the shared memory offset
-          acc[u] = ld_shared<BytePerPack>(cvta_to_shared((void*)minSrcs[0]));
+          acc[u] = ld_shared<BytePerPack>(minShSrcs[0]);
+          minShSrcs[0] += WARP_SIZE*BytePerPack;
           if (0 < PreOpSrcs) acc[u] = applyPreOp(redFn, acc[u]);
         }
-        minSrcs[0] += WARP_SIZE*BytePerPack;
       }
     }
 
@@ -394,10 +396,11 @@ __device__ __forceinline__ void reduceCopyPacksShared(
       for (int u=0; u < Unroll; u++) {
         if (s < MultimemSrcs) {
           tmp[u] = applyLoadMultimem<RedFn, BytePerPack>(redFn, minSrcs[s]);
+          minSrcs[s] += WARP_SIZE*BytePerPack;
         } else {
-          tmp[u] = ld_shared<BytePerPack>(cvta_to_shared((void*)minSrcs[s]));
+          tmp[u] = ld_shared<BytePerPack>(minShSrcs[s]);
+          minShSrcs[s] += WARP_SIZE*BytePerPack;
         }
-        minSrcs[s] += WARP_SIZE*BytePerPack;
       }
       #pragma unroll Unroll
       for (int u=0; u < Unroll; u++) {
@@ -406,11 +409,11 @@ __device__ __forceinline__ void reduceCopyPacksShared(
     }
 
     for (int s=MinSrcs; (MinSrcs < MaxSrcs) && (s < MaxSrcs) && (s < nSrcs); s++) {
-      uintptr_t src = (uintptr_t)(srcPtrFn(s)) + threadBytesBehind;
+      uint32_t src = cvta_to_shared((void*)((uintptr_t)(srcPtrFn(s)) + threadBytesBehind));
       BytePack<BytePerPack> tmp[Unroll];
       #pragma unroll Unroll
       for (int u=0; u < Unroll; u++) {
-        tmp[u] = ld_shared<BytePerPack>(cvta_to_shared((void*)src));
+        tmp[u] = ld_shared<BytePerPack>(src);
         src += WARP_SIZE*BytePerPack;
       }
       #pragma unroll Unroll
@@ -461,7 +464,8 @@ __device__ __forceinline__ void reduceCopyPacksShared(
     nWarps = nThreads/WARP_SIZE;
     #pragma unroll
     for (int s=0; s < MinSrcs; s++) {
-      minSrcs[s] += (nWarps-1)*BytePerHunk;
+      if (s < MultimemSrcs) minSrcs[s] += (nWarps-1)*BytePerHunk;
+      else minShSrcs[s] += (nWarps-1)*BytePerHunk;
     }
     #pragma unroll
     for (int d=0; d < MinDsts; d++) {

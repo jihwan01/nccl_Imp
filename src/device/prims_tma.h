@@ -271,10 +271,8 @@ private:
         subBarrier();
 
         // Slice-level waitPeer, tile-level TMA pipeline
+        char* tmaShmemBase = (char*)ncclTmaShmemPtr();
         T* tmaSliceBaseSrc = nullptr;
-        T* tmaSliceBaseDst = nullptr;
-        T* peerFifoBase = nullptr;  // Base pointer for dsts[1] (peer FIFO in Send)
-        T* peerSrcBase = nullptr;   // Base pointer for srcs[1] (peer FIFO in Recv)
 
         while (slice < SlicePerChunk && offset < nelem) {
           int currSliceSize = (sliceSize < nelem-offset) ? sliceSize : nelem-offset;
@@ -313,15 +311,6 @@ private:
 
           // Store slice base pointers once waitPeer/setup is complete.
           tmaSliceBaseSrc = (T*)ncclShmem.groups[group].srcs[0];
-          tmaSliceBaseDst = (T*)ncclShmem.groups[group].dsts[0];
-          // Save base pointer for dsts[1] (peer FIFO) if Send path
-          if (Send && Dst && ncclShmem.groups[group].dsts[1] != nullptr) {
-            peerFifoBase = (T*)ncclShmem.groups[group].dsts[1];
-          }
-          // Save base pointer for srcs[1] (peer FIFO) if Recv path
-          if (Recv && Src && ncclShmem.groups[group].srcs[1] != nullptr) { // For operation involving reduce operation
-            peerSrcBase = (T*)ncclShmem.groups[group].srcs[1];
-          }
 
           int sliceTiles = (currSliceSize + tmaTileSize - 1) / tmaTileSize;
           int preloadCount = min(NCCL_TMA_PIPE_DEPTH, sliceTiles);
@@ -337,7 +326,7 @@ private:
               
               int tmaSlot = i % NCCL_TMA_PIPE_DEPTH;
               void* globalSrc = (void*)(tmaSliceBaseSrc + tileOffset);
-              void* shmemDst = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
+              void* shmemDst = tmaShmemBase + tmaSlot * NCCL_TMA_SLOT_SIZE;
               size_t copySize = currTileSize * sizeof(T);
 
               #if ENABLE_TILE_PROFILING
@@ -437,36 +426,36 @@ private:
             // CONSUME
             // =======
 
-            #if ENABLE_TILE_PROFILING
-            // Cost of making updated srcs/dsts pointers visible to worker threads.
-            long long tPtrSyncStart = clock64();
-            #endif
-
-            // Pointer swap for consumer and tile dst adjustment
-            if (tid == 0) {
-              // Update srcs[0] to point to SMEM for this tile (Send and Recv paths)
-              ncclShmem.groups[group].srcs[0] = (char*)ncclTmaShmemPtr() + tmaSlot * NCCL_TMA_SLOT_SIZE;
-              
-              // Update dsts[0] to output buffer for this tile
-              if (Dst && tmaSliceBaseDst != nullptr) {
-                ncclShmem.groups[group].dsts[0] = tmaSliceBaseDst + tileOffset;
-              }
-              
-              // Update dsts[1] (peer FIFO) for Send path
-              if (Send && peerFifoBase != nullptr) {
-                ncclShmem.groups[group].dsts[1] = peerFifoBase + tileOffset;
-              }
+            const int localGroup = group;
+            constexpr int MaxTileSrcs = Recv * MaxRecv + Src;
+            constexpr int MaxTileDsts = Send * MaxSend + Dst;
+            void* tileSrcs[MaxTileSrcs + !MaxTileSrcs];
+            void* tileDsts[MaxTileDsts + !MaxTileDsts];
+            #pragma unroll
+            for (int i = 0; i < MaxTileSrcs; ++i) {
+              T* srcBase = (T*)ncclShmem.groups[localGroup].srcs[i];
+              tileSrcs[i] = srcBase == nullptr ? nullptr : srcBase + tileOffset;
             }
-            subBarrier();
-
+            #pragma unroll
+            for (int i = 0; i < MaxTileDsts; ++i) {
+              T* dstBase = (T*)ncclShmem.groups[localGroup].dsts[i];
+              tileDsts[i] = dstBase == nullptr ? nullptr : dstBase + tileOffset;
+            }
+            if (MaxTileSrcs > 0) tileSrcs[0] = tmaShmemBase + tmaSlot * NCCL_TMA_SLOT_SIZE;
+            T* tileSrc0 = MaxTileSrcs > 0 ? (T*)tileSrcs[0] : nullptr;
+            T* tileDst0 = MaxTileDsts > 0 ? (T*)tileDsts[0] : nullptr;
+            T* tileDst1 = MaxTileDsts > 1 ? (T*)tileDsts[1] : nullptr;
+            auto tileSrcPtr = [=] __device__ (int i) -> void* {
+              return tileSrcs[i];
+            };
+            auto tileDstPtr = [=] __device__ (int i) -> void* {
+              return tileDsts[i];
+            };
+            auto tileDstPtrFrom1 = [=] __device__ (int i) -> void* {
+              return tileDsts[i + 1];
+            };
 
             #if ENABLE_TILE_PROFILING
-            long long tPtrSyncEnd = clock64();
-            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = tPtrSyncEnd - tPtrSyncStart;
-              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_PTR_SYNC,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
-            }
-
             long long tPtrWarpSpecStart = clock64();
             #endif
 
@@ -524,16 +513,16 @@ private:
             }
 
             if (isTmaComputeThread) {
-              if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
+              if (DirectRecv && tileSrc0 == tileDst0
                   && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
-                if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
+                if (Send && Dst && tileSrc0 != tileDst1) {
                   #if ENABLE_TILE_PROFILING
                   copyPath = "DIRECT_RECV_FWD";
                   #endif
                   reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
                     (tid, tmaComputeWorkers, /*redArg*/0, /*postOp*/false,
-                    1, ncclShmem.groups[group].srcs,
-                    fan.nsend(), ncclShmem.groups[group].dsts+1,
+                    1, tileSrcPtr,
+                    fan.nsend(), tileDstPtrFrom1,
                     workSize);
                 } else {
                   #if ENABLE_TILE_PROFILING
@@ -546,12 +535,12 @@ private:
                 #endif
                 reduceCopyShared<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
                   (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
-                  Recv, ncclShmem.groups[group].srcs,
-                  Dst, ncclShmem.groups[group].dsts,
+                  Recv, tileSrcPtr,
+                  Dst, tileDstPtr,
                   workSize);
-              } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+              } else if (tileSrc0 && tileDst0) {
                 constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
-                if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
+                if (Send && Dst && tileDst1 == nullptr) {
                   #if ENABLE_TILE_PROFILING
                   copyPath = "GENERIC_SINGLE_DST";
                   #endif
@@ -559,8 +548,8 @@ private:
                     0, Recv + Src, Recv * MaxRecv + Src,
                     0, 1, 1, PreOpSrcs>
                     (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
-                      Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                      1, ncclShmem.groups[group].dsts,
+                      Recv * fan.nrecv() + Src, tileSrcPtr,
+                      1, tileDstPtr,
                       workSize);
                 } else {
                   #if ENABLE_TILE_PROFILING
@@ -570,8 +559,8 @@ private:
                     MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
                     MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
                     (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
-                      Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                      Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+                      Recv * fan.nrecv() + Src, tileSrcPtr,
+                      Send * fan.nsend() + Dst, tileDstPtr,
                       workSize);
                 }
               } else {
@@ -593,7 +582,7 @@ private:
 
             if (overlapIssue && isTmaIssuerThread) {
               void* globalSrc = (void*)(tmaSliceBaseSrc + issueOffset);
-              void* shmemDst = (char*)ncclTmaShmemPtr() + issueSlot * NCCL_TMA_SLOT_SIZE;
+              void* shmemDst = tmaShmemBase + issueSlot * NCCL_TMA_SLOT_SIZE;
               size_t copySize = issueTileSize * sizeof(T);
 
               #if ENABLE_TILE_PROFILING
@@ -639,8 +628,8 @@ private:
             }
             
             tileOffset += currTileSize;
-            // Ensure all workers have finished consuming this tile before tid0
-            // updates shared srcs/dsts pointers for the next tile.
+            // Ensure all workers have finished consuming this tile before its
+            // shared-memory TMA slot can be reused by a later tile.
 
             #if ENABLE_TILE_PROFILING
             long long tTailSyncStart = clock64();
