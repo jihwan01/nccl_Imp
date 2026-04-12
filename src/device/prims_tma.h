@@ -407,6 +407,10 @@ private:
           // =======================================================
           // =================== Main Loop Phase ===================
           // =======================================================
+          const int issueLookahead = hasDedicatedTmaIssueWarp ? (NCCL_TMA_PIPE_DEPTH - 1) : NCCL_TMA_PIPE_DEPTH;
+          int firstOverlapTile = hasDedicatedTmaIssueWarp ? preloadCount - issueLookahead : 0;
+          if (firstOverlapTile < 0) firstOverlapTile = 0;
+          const int overlapTileEnd = sliceTiles - issueLookahead;
           tileOffset = 0;
           for (int t=0; t<sliceTiles; ++t) {
             int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
@@ -478,12 +482,10 @@ private:
             long long tPtrWarpSpecStart = clock64();
             #endif
 
-            // In specialized mode, issue(t+depth"-1") to overlap with current consume.
+            // In specialized mode, issue(t+depth-1) to overlap with current consume.
             // Without specialization, keep the original refill schedule issue(t+depth).
-            int issueTileIdx = t + (hasDedicatedTmaIssueWarp ? (NCCL_TMA_PIPE_DEPTH - 1) : NCCL_TMA_PIPE_DEPTH);
-
-            bool overlapIssue = issueTileIdx < sliceTiles;
-            if (hasDedicatedTmaIssueWarp) overlapIssue &= issueTileIdx >= preloadCount;
+            int issueTileIdx = t + issueLookahead;
+            bool overlapIssue = t >= firstOverlapTile && t < overlapTileEnd;
             int issueOffset = 0;
             int issueTileSize = 0;
             int issueSlot = 0;
