@@ -257,10 +257,10 @@ private:
     // Only enable when fan-in/out is 1 (ring-like path), then reserve the last
     // worker warp for issuing TMA copies while earlier worker warps keep computing.
     constexpr bool TmaIssueWarpEligible = (MaxRecv <= 1 && MaxSend <= 1);
-    const bool hasDedicatedTmaIssueWarp = TmaIssueWarpEligible && nworkers >= 2 * WARP_SIZE;
-    const int tmaComputeWorkers = hasDedicatedTmaIssueWarp ? (nworkers - WARP_SIZE) : nworkers;
+    static_assert(TmaIssueWarpEligible, "ProtoTMA currently assumes a dedicated issue warp.");
+    const int tmaComputeWorkers = nworkers - WARP_SIZE;
     const bool isTmaComputeThread = tid < tmaComputeWorkers;
-    const bool isTmaIssuerThread = tid == (hasDedicatedTmaIssueWarp ? tmaComputeWorkers : 0);
+    const bool isTmaIssuerThread = tid == tmaComputeWorkers;
 
     if (tid < nworkers && offset < nelem && !isNetOffload) {
       if (useTma) {
@@ -346,6 +346,11 @@ private:
           }
 
           int sliceTiles = (currSliceSize + tmaTileSize - 1) / tmaTileSize;
+          bool sliceFullTileSharedBigPackFast =
+            MultimemSrcs == 0 &&
+            sliceSharedBigPackAligned &&
+            TmaSharedAlign > (int)sizeof(T) &&
+            tmaComputeWorkers * NCCL_TMA_UNROLL * TmaSharedAlign == tmaTileSize * (int)sizeof(T);
           int preloadCount = min(NCCL_TMA_PIPE_DEPTH, sliceTiles);
           int tileOffset = 0;
 
@@ -420,8 +425,8 @@ private:
           // =======================================================
           // =================== Main Loop Phase ===================
           // =======================================================
-          const int issueLookahead = hasDedicatedTmaIssueWarp ? (NCCL_TMA_PIPE_DEPTH - 1) : NCCL_TMA_PIPE_DEPTH;
-          int firstOverlapTile = hasDedicatedTmaIssueWarp ? preloadCount - issueLookahead : 0;
+          const int issueLookahead = NCCL_TMA_PIPE_DEPTH - 1;
+          int firstOverlapTile = preloadCount - issueLookahead;
           if (firstOverlapTile < 0) firstOverlapTile = 0;
           const int overlapTileEnd = sliceTiles - issueLookahead;
           tileOffset = 0;
@@ -432,6 +437,62 @@ private:
             #if ENABLE_TILE_PROFILING
             const char* tileOpName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
             #endif
+
+            #if ENABLE_TILE_PROFILING
+            long long tPtrWarpSpecStart = clock64();
+            #endif
+
+            // In specialized mode, issue(t+depth-1) at the top of the loop.
+            // The issue warp does not consume the current tile, so it should not
+            // wait for current-tile pointer setup or reduce-copy work.
+            int issueTileIdx = t + issueLookahead;
+            bool overlapIssue = t >= firstOverlapTile && t < overlapTileEnd;
+            int issueOffset = 0;
+            int issueTileSize = 0;
+            int issueSlot = 0;
+            if (overlapIssue) {
+              issueOffset = issueTileIdx * tmaTileSize;
+              issueTileSize = (tmaTileSize < currSliceSize - issueOffset) ? tmaTileSize : currSliceSize - issueOffset;
+              issueSlot = issueTileIdx % NCCL_TMA_PIPE_DEPTH;
+              if (!isTmaIssuerThread) {
+                tmaTokens[issueSlot] = barriers[issueSlot].arrive();
+              }
+            }
+
+            #if ENABLE_TILE_PROFILING
+            long long tPtrWarpSpecEnd = clock64();
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = tPtrWarpSpecEnd - tPtrWarpSpecStart;
+              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_PTR_WARP_SPEC,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
+            }
+            #endif
+
+            if (overlapIssue && isTmaIssuerThread) {
+              void* globalSrc = (void*)(tmaSliceBaseSrc + issueOffset);
+              void* shmemDst = tmaShmemBase + issueSlot * NCCL_TMA_SLOT_SIZE;
+              size_t copySize = issueTileSize * sizeof(T);
+
+              #if ENABLE_TILE_PROFILING
+              long long tIssueStart = clock64();
+              #endif
+
+              cuda::device::memcpy_async_tx(
+                  (char*)shmemDst,
+                  (char*)globalSrc,
+                  cuda::aligned_size_t<16>(copySize),
+                  barriers[issueSlot]
+              );
+              tmaTokens[issueSlot] = cuda::device::barrier_arrive_tx(barriers[issueSlot], 1, copySize);
+
+              #if ENABLE_TILE_PROFILING
+              long long t1_issue_overlap = clock64();
+              if (ncclShmem.channelId == 0 && profileChunkId == 0) {
+                long long dt = t1_issue_overlap - tIssueStart;
+                const char* issueOpName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE_ENQ_OVERLAP,%lld\n", ncclShmem.channelId, profileChunkId, slice, issueTileIdx, issueOpName, dt);
+              }
+              #endif
+            }
 
             #if ENABLE_TILE_PROFILING
             long long tTilePtrSetupStart = clock64();
@@ -472,38 +533,8 @@ private:
             }
             #endif
 
-            #if ENABLE_TILE_PROFILING
-            long long tPtrWarpSpecStart = clock64();
-            #endif
-
-            // In specialized mode, issue(t+depth-1) to overlap with current consume.
-            // Without specialization, keep the original refill schedule issue(t+depth).
-            int issueTileIdx = t + issueLookahead;
-            bool overlapIssue = t >= firstOverlapTile && t < overlapTileEnd;
-            int issueOffset = 0;
-            int issueTileSize = 0;
-            int issueSlot = 0;
-            if (overlapIssue) {
-              issueOffset = issueTileIdx * tmaTileSize;
-              issueTileSize = (tmaTileSize < currSliceSize - issueOffset) ? tmaTileSize : currSliceSize - issueOffset;
-              issueSlot = issueTileIdx % NCCL_TMA_PIPE_DEPTH;
-              if (hasDedicatedTmaIssueWarp && !isTmaIssuerThread) {
-                // Dedicated issue mode uses a future slot, so this arrival can
-                // overlap with the current tile's TMA wait.
-                tmaTokens[issueSlot] = barriers[issueSlot].arrive();
-              }
-            }
-
             int workSize = ncclShmem.aborted ? 0 : currTileSize;
-            
-            
-            #if ENABLE_TILE_PROFILING
-            long long tPtrWarpSpecEnd = clock64();
-            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = tPtrWarpSpecEnd - tPtrWarpSpecStart;
-              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_PTR_WARP_SPEC,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
-            }
-            #endif
+            const bool fullTileSharedBigPackFast = sliceFullTileSharedBigPackFast && t != sliceTiles - 1;
 
             // ================
             // wait for preload
@@ -521,10 +552,6 @@ private:
               printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
             }
             #endif
-
-            if (overlapIssue && !hasDedicatedTmaIssueWarp && !isTmaIssuerThread) {
-              tmaTokens[issueSlot] = barriers[issueSlot].arrive();
-            }
 
             // ===========
             // Reduce Copy
@@ -559,7 +586,12 @@ private:
                   #if ENABLE_TILE_PROFILING
                   copyPath = "DIRECT_RECV_FWD";
                   #endif
-                  if (sliceSharedBigPackAligned) {
+                  if (fullTileSharedBigPackFast) {
+                    reduceCopySharedAlignedFullTile<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+                      (tid, /*redArg*/0, /*postOp*/false,
+                      1, tileSrcPtr,
+                      fan.nsend(), tileDstPtrFrom1);
+                  } else if (sliceSharedBigPackAligned) {
                     reduceCopySharedAligned<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
                       (tid, tmaComputeWorkers, /*redArg*/0, /*postOp*/false,
                       1, tileSrcPtr,
@@ -581,7 +613,12 @@ private:
                 #if ENABLE_TILE_PROFILING
                 copyPath = "DIRECT_SEND_NULL_DST";
                 #endif
-                if (sliceSharedBigPackAligned) {
+                if (fullTileSharedBigPackFast) {
+                  reduceCopySharedAlignedFullTile<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+                    (tid, ncclShmem.groups[group].redOpArgs, postOp,
+                    Recv, tileSrcPtr,
+                    Dst, tileDstPtr);
+                } else if (sliceSharedBigPackAligned) {
                   reduceCopySharedAligned<NCCL_TMA_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
                     (tid, tmaComputeWorkers, ncclShmem.groups[group].redOpArgs, postOp,
                     Recv, tileSrcPtr,
@@ -600,7 +637,14 @@ private:
                   #if ENABLE_TILE_PROFILING
                   copyPath = "GENERIC_SINGLE_DST";
                   #endif
-                  if (sliceSharedBigPackAligned) {
+                  if (fullTileSharedBigPackFast) {
+                    reduceCopySharedAlignedFullTile<NCCL_TMA_UNROLL, RedOp, T,
+                      0, Recv + Src, Recv * MaxRecv + Src,
+                      0, 1, 1, PreOpSrcs>
+                      (tid, ncclShmem.groups[group].redOpArgs, postOp,
+                        Recv * fan.nrecv() + Src, tileSrcPtr,
+                        1, tileDstPtr);
+                  } else if (sliceSharedBigPackAligned) {
                     reduceCopySharedAligned<NCCL_TMA_UNROLL, RedOp, T,
                       0, Recv + Src, Recv * MaxRecv + Src,
                       0, 1, 1, PreOpSrcs>
@@ -621,7 +665,14 @@ private:
                   #if ENABLE_TILE_PROFILING
                   copyPath = "GENERIC_MULTI_DST";
                   #endif
-                  if (sliceSharedBigPackAligned) {
+                  if (fullTileSharedBigPackFast) {
+                    reduceCopySharedAlignedFullTile<NCCL_TMA_UNROLL, RedOp, T,
+                      MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+                      MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+                      (tid, ncclShmem.groups[group].redOpArgs, postOp,
+                        Recv * fan.nrecv() + Src, tileSrcPtr,
+                        Send * fan.nsend() + Dst, tileDstPtr);
+                  } else if (sliceSharedBigPackAligned) {
                     reduceCopySharedAligned<NCCL_TMA_UNROLL, RedOp, T,
                       MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
                       MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
@@ -656,33 +707,6 @@ private:
             }
             #endif
 
-            if (overlapIssue && isTmaIssuerThread) {
-              void* globalSrc = (void*)(tmaSliceBaseSrc + issueOffset);
-              void* shmemDst = tmaShmemBase + issueSlot * NCCL_TMA_SLOT_SIZE;
-              size_t copySize = issueTileSize * sizeof(T);
-
-              #if ENABLE_TILE_PROFILING
-              long long tIssueStart = clock64();
-              #endif
-
-              cuda::device::memcpy_async_tx(
-                  (char*)shmemDst,
-                  (char*)globalSrc,
-                  cuda::aligned_size_t<16>(copySize),
-                  barriers[issueSlot]
-              );
-              tmaTokens[issueSlot] = cuda::device::barrier_arrive_tx(barriers[issueSlot], 1, copySize);
-
-              #if ENABLE_TILE_PROFILING
-              long long t1_issue_overlap = clock64();
-              if (ncclShmem.channelId == 0 && profileChunkId == 0) {
-                long long dt = t1_issue_overlap - tIssueStart;
-                const char* issueOpName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
-                printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_ISSUE_ENQ_OVERLAP,%lld\n", ncclShmem.channelId, profileChunkId, slice, issueTileIdx, issueOpName, dt);
-              }
-              #endif
-            }
-            
             tileOffset += currTileSize;
             // Ensure all workers have finished consuming this tile before its
             // shared-memory TMA slot can be reused by a later tile.

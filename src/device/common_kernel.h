@@ -493,6 +493,146 @@ __device__ __forceinline__ void reduceCopyPacksShared(
   #endif
 }
 
+template<typename RedFn, typename T, int Unroll, int BytePerPack,
+         int MultimemSrcs, int MinSrcs, int MaxSrcs,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         typename SrcPtrFn, typename DstPtrFn>
+__device__ __forceinline__ void reduceCopyPacksSharedFullTile(
+    int thread,
+    uint64_t redArg, bool postOp,
+    int nSrcs, SrcPtrFn const &srcPtrFn, int nDsts, DstPtrFn const &dstPtrFn
+  ) {
+  if (BytePerPack == 0) __trap();
+
+  constexpr int BytePerHunk = Unroll*WARP_SIZE*BytePerPack;
+  int warp = thread/WARP_SIZE;
+  int lane = thread%WARP_SIZE;
+  uintptr_t threadBytesBehind = warp*BytePerHunk + lane*BytePerPack;
+
+  RedFn redFn(redArg);
+  uintptr_t minSrcs[MinSrcs + !MinSrcs];
+  uint32_t minShSrcs[MinSrcs + !MinSrcs];
+  uintptr_t minDsts[MinDsts + !MinDsts];
+
+  #pragma unroll
+  for (int s=0; s < MinSrcs; s++) {
+    uintptr_t src = (uintptr_t)(srcPtrFn(s)) + threadBytesBehind;
+    if (s < MultimemSrcs) minSrcs[s] = src;
+    else minShSrcs[s] = cvta_to_shared((void*)src);
+  }
+
+  #pragma unroll
+  for (int d=0; d < MinDsts; d++) {
+    minDsts[d] = cvta_to_global(dstPtrFn(d)) + threadBytesBehind;
+  }
+
+  BytePack<BytePerPack> acc[Unroll];
+  {
+    #pragma unroll Unroll
+    for (int u=0; u < Unroll; u++) {
+      if (0 < MultimemSrcs) {
+        acc[u] = applyLoadMultimem<RedFn, BytePerPack>(redFn, minSrcs[0]);
+        minSrcs[0] += WARP_SIZE*BytePerPack;
+      } else {
+        acc[u] = ld_shared<BytePerPack>(minShSrcs[0]);
+        minShSrcs[0] += WARP_SIZE*BytePerPack;
+        if (0 < PreOpSrcs) acc[u] = applyPreOp(redFn, acc[u]);
+      }
+    }
+  }
+
+  #pragma unroll (MinSrcs-1 + !(MinSrcs-1))
+  for (int s=1; s < MinSrcs; s++) {
+    BytePack<BytePerPack> tmp[Unroll];
+    #pragma unroll Unroll
+    for (int u=0; u < Unroll; u++) {
+      if (s < MultimemSrcs) {
+        tmp[u] = applyLoadMultimem<RedFn, BytePerPack>(redFn, minSrcs[s]);
+        minSrcs[s] += WARP_SIZE*BytePerPack;
+      } else {
+        tmp[u] = ld_shared<BytePerPack>(minShSrcs[s]);
+        minShSrcs[s] += WARP_SIZE*BytePerPack;
+      }
+    }
+    #pragma unroll Unroll
+    for (int u=0; u < Unroll; u++) {
+      acc[u] = applyReduce(redFn, acc[u], tmp[u]);
+    }
+  }
+
+  for (int s=MinSrcs; (MinSrcs < MaxSrcs) && (s < MaxSrcs) && (s < nSrcs); s++) {
+    uint32_t src = cvta_to_shared((void*)((uintptr_t)(srcPtrFn(s)) + threadBytesBehind));
+    BytePack<BytePerPack> tmp[Unroll];
+    #pragma unroll Unroll
+    for (int u=0; u < Unroll; u++) {
+      tmp[u] = ld_shared<BytePerPack>(src);
+      src += WARP_SIZE*BytePerPack;
+    }
+    #pragma unroll Unroll
+    for (int u=0; u < Unroll; u++) {
+      acc[u] = applyReduce(redFn, acc[u], tmp[u]);
+    }
+  }
+
+  if (postOp) {
+    #pragma unroll Unroll
+    for (int u=0; u < Unroll; u++)
+      acc[u] = applyPostOp(redFn, acc[u]);
+  }
+
+  #pragma unroll (MinDsts + !MinDsts)
+  for (int d=0; d < MinDsts; d++) {
+    #pragma unroll Unroll
+    for (int u=0; u < Unroll; u++) {
+      if (d < MultimemDsts) {
+        multimem_st_global(minDsts[d], acc[u]);
+      } else {
+        st_global<BytePerPack>(minDsts[d], acc[u]);
+      }
+      minDsts[d] += WARP_SIZE*BytePerPack;
+    }
+  }
+
+  for (int d=MinDsts; (MinDsts < MaxDsts) && (d < MaxDsts) && (d < nDsts); d++) {
+    uintptr_t dstPtr = cvta_to_global(dstPtrFn(d));
+    uintptr_t dst = dstPtr + threadBytesBehind;
+    #pragma unroll Unroll
+    for (int u=0; u < Unroll; u++) {
+      st_global<BytePerPack>(dst, acc[u]);
+      dst += WARP_SIZE*BytePerPack;
+    }
+  }
+}
+
+template<int Unroll, typename RedFn, typename T,
+         int MultimemSrcs, int MinSrcs, int MaxSrcs,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         typename SrcPtrFn, typename DstPtrFn>
+__device__ __forceinline__ void reduceCopySharedAlignedFullTile(
+    int thread,
+    uint64_t redArg, bool postOp,
+    int nSrcs, SrcPtrFn const &srcPtrFn, int nDsts, DstPtrFn const &dstPtrFn
+  ) {
+  static_assert(MultimemSrcs <= MinSrcs && MultimemDsts <= MinDsts, "Multimem pointers cannot exceed respective Min values.");
+  constexpr int BigPackSize = (MultimemSrcs == 0) ? 16 : LoadMultimem_BigPackSize<RedFn>::BigPackSize;
+
+  if (MaxDsts==0) return;
+  if (MinDsts==0 && nDsts==0) return;
+
+  #if __cpp_if_constexpr
+  if constexpr (BigPackSize > sizeof(T)) {
+  #else
+  if (BigPackSize > sizeof(T)) {
+  #endif
+    reduceCopyPacksSharedFullTile<RedFn, T, Unroll, BigPackSize,
+      MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+      (thread, redArg, postOp, nSrcs, srcPtrFn, nDsts, dstPtrFn);
+  } else {
+    // TMA fast path is intended for sub-16B element types. Keep larger element
+    // types on the generic aligned path instead of adding another full-tile body.
+  }
+}
+
 template<int Unroll, typename RedFn, typename T,
          int MultimemSrcs, int MinSrcs, int MaxSrcs,
          int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
