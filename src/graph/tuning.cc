@@ -12,6 +12,7 @@
 
 NCCL_PARAM(Nthreads, "NTHREADS", -2);
 NCCL_PARAM(Ll128Nthreads, "LL128_NTHREADS", -2);
+NCCL_PARAM(TmaNthreads, "TMA_NTHREADS", -2);
 
 static int getNthreads(const char* name, int env, int min, int max, int def) {
   int nt = env;
@@ -242,8 +243,11 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL128] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_LL128] =
     getNthreads("NCCL_LL128_NTHREADS", ncclParamLl128Nthreads(), NCCL_LL128_MAX_NTHREADS/4, NCCL_LL128_MAX_NTHREADS, NCCL_LL128_MAX_NTHREADS);
 
-  // [jihwan][TMA Support] Initialize TMA threads (mirroring Simple)
-  comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_TMA] = comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
+  // [jihwan][TMA Support] 32KB TMA tiles need only 8 compute warps for the
+  // 16B-pack/unroll=8 shared->global path. Enqueue adds two more warps for
+  // sync/post and TMA issue specialization, so the default ring block is 320.
+  comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_TMA] =
+    getNthreads("NCCL_TMA_NTHREADS", ncclParamTmaNthreads(), 2*WARP_SIZE, NCCL_SIMPLE_MAX_NTHREADS, 8*WARP_SIZE);
   comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_TMA] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_SIMPLE];
   comm->maxThreads[NCCL_ALGO_COLLNET_DIRECT][NCCL_PROTO_TMA] =
     comm->maxThreads[NCCL_ALGO_COLLNET_CHAIN][NCCL_PROTO_TMA] =
