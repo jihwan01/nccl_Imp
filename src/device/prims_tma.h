@@ -306,13 +306,15 @@ private:
               const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
               printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
           }
-          
-          t0_slice_copy = clock64();
           #endif
 
           // ================================================================
           // =================== ReduceCopy or Copy Phase ===================
           // ================================================================
+
+          #if ENABLE_SLICE_PROFILING
+          long long tSliceCopySetupStart = clock64();
+          #endif
 
           // Store slice base pointers once waitPeer/setup is complete.
           tmaSliceBaseSrc = (T*)ncclShmem.groups[group].srcs[0];
@@ -346,6 +348,17 @@ private:
           int sliceTiles = (currSliceSize + tmaTileSize - 1) / tmaTileSize;
           int preloadCount = min(NCCL_TMA_PIPE_DEPTH, sliceTiles);
           int tileOffset = 0;
+
+          #if ENABLE_SLICE_PROFILING
+          long long tSliceCopySetupEnd = clock64();
+          if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = tSliceCopySetupEnd - tSliceCopySetupStart;
+              const char* opName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
+              printf("NCCL_PROFILE_SLICE,%d,%d,%d,%s_COPY_SETUP,%lld\n", ncclShmem.channelId, profileChunkId, slice, opName, dt);
+          }
+          // Keep slice copy phases non-overlapping: COPY_PRE starts after setup.
+          t0_slice_copy = clock64();
+          #endif
 
           // =====================================================
           // =================== Preload Phase ===================
@@ -416,35 +429,16 @@ private:
             int currTileSize = (tmaTileSize < currSliceSize - tileOffset) ? tmaTileSize : currSliceSize - tileOffset;
             int tmaSlot = t % NCCL_TMA_PIPE_DEPTH;
 
-            // ================
-            // wait for preload
-            // ================
             #if ENABLE_TILE_PROFILING
             const char* tileOpName = (Send && Recv) ? "RECVSEND" : (Send ? "SEND" : "RECV");
-            // Tile STEP starts here; WAIT is measured until tAfterWait.
-            long long tTileIterStart = clock64();
             #endif
-
-            barriers[tmaSlot].wait(std::move(tmaTokens[tmaSlot]));
-
-            #if ENABLE_TILE_PROFILING
-            long long tAfterWait = clock64();
-            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
-              long long dt = tAfterWait - tTileIterStart;
-              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
-            }
-            // CONSUME starts after wait(token) is done.
-            long long tConsumeStart = tAfterWait;
-            #endif
-
-            // =======
-            // CONSUME
-            // =======
 
             #if ENABLE_TILE_PROFILING
             long long tTilePtrSetupStart = clock64();
             #endif
 
+            // These addresses depend only on the tile index and slice-local
+            // bases, so compute them before waiting for the TMA payload.
             T* tileSrc0 = MaxTileSrcs > 0 ? (T*)(tmaShmemBase + tmaSlot * NCCL_TMA_SLOT_SIZE) : nullptr;
             T* tileDst0 = nullptr;
             if (MaxTileDsts > 0) {
@@ -493,24 +487,49 @@ private:
               issueOffset = issueTileIdx * tmaTileSize;
               issueTileSize = (tmaTileSize < currSliceSize - issueOffset) ? tmaTileSize : currSliceSize - issueOffset;
               issueSlot = issueTileIdx % NCCL_TMA_PIPE_DEPTH;
-              if (!isTmaIssuerThread) {
-                tmaTokens[issueSlot] = barriers[issueSlot].arrive(); //
+              if (hasDedicatedTmaIssueWarp && !isTmaIssuerThread) {
+                // Dedicated issue mode uses a future slot, so this arrival can
+                // overlap with the current tile's TMA wait.
+                tmaTokens[issueSlot] = barriers[issueSlot].arrive();
               }
             }
 
             int workSize = ncclShmem.aborted ? 0 : currTileSize;
             
             
-            // ===========
-            // Reduce Copy
-            // ===========
             #if ENABLE_TILE_PROFILING
-            
             long long tPtrWarpSpecEnd = clock64();
             if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
               long long dt = tPtrWarpSpecEnd - tPtrWarpSpecStart;
               printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_PTR_WARP_SPEC,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
             }
+            #endif
+
+            // ================
+            // wait for preload
+            // ================
+            #if ENABLE_TILE_PROFILING
+            long long tTileIterStart = clock64();
+            #endif
+
+            barriers[tmaSlot].wait(std::move(tmaTokens[tmaSlot]));
+
+            #if ENABLE_TILE_PROFILING
+            long long tAfterWait = clock64();
+            if (tid == 0 && ncclShmem.channelId == 0 && profileChunkId == 0) {
+              long long dt = tAfterWait - tTileIterStart;
+              printf("NCCL_PROFILE_TILE,%d,%d,%d,%d,%s_WAIT,%lld\n", ncclShmem.channelId, profileChunkId, slice, t, tileOpName, dt);
+            }
+            #endif
+
+            if (overlapIssue && !hasDedicatedTmaIssueWarp && !isTmaIssuerThread) {
+              tmaTokens[issueSlot] = barriers[issueSlot].arrive();
+            }
+
+            // ===========
+            // Reduce Copy
+            // ===========
+            #if ENABLE_TILE_PROFILING
             long long tCopyCoreStart = clock64();
             const char* copyPath = "UNSET";
             #endif
